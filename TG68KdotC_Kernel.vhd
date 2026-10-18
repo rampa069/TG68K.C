@@ -882,7 +882,7 @@ PROCESS (clk, setdisp, memaddr_a, briefdata, memaddr_delta, setdispbyte, datatyp
 				IF set_Z_error='1' THEN
 					trap_vector(9 downto 0) <= "00" & X"14";
 				END IF;	
-				IF exec(trap_chk)='1' THEN
+				IF exec(trap_chk)='1' AND decodeOPC='0' THEN	-- not a stale CHK, see trap00
 					trap_vector(9 downto 0) <= "00" & X"18";
 				END IF;	
 				IF trap_trapv='1' THEN
@@ -1516,7 +1516,9 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 			setstate <= "01";
 		END IF;	
 		IF trapmake='1' AND trapd='0' THEN
-			IF cpu(1)='1' AND (trap_trapv='1' OR set_Z_error='1' OR exec(trap_chk)='1') THEN
+			-- exec(trap_chk) still holds a CHK that did not trap during the decode
+			-- cycle of the next instruction: a CHK only traps outside decode
+			IF cpu(1)='1' AND (trap_trapv='1' OR set_Z_error='1' OR (exec(trap_chk)='1' AND decodeOPC='0')) THEN
 				next_micro_state <= trap00;
 			else
 				next_micro_state <= trap0;
