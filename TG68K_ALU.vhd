@@ -140,6 +140,7 @@ architecture logic of TG68K_ALU is
 	signal div_bit				: std_logic;
 	signal div_sub				: std_logic_vector(32 downto 0);
 	signal div_over			: std_logic_vector(32 downto 0);
+	signal div_over_s		: std_logic_vector(32 downto 0);	-- |dividend| high - |divisor| (DIVS.L)
 	signal nozero				: std_logic;
 	signal div_qsign			: std_logic;
 	signal dividend			: std_logic_vector(63 downto 0);
@@ -1248,7 +1249,7 @@ PROCESS (clk)
 ---- DIVU/DIVS
 -------------------------------------------------------------------------------
 		
-PROCESS (execOPC, OP1out, OP2out, div_reg, div_neg, div_bit, div_sub, div_quot, OP1_sign, div_over, result_div, reg_QA, opcode, sndOPC, divs, exe_opcode, reg_QB, 
+PROCESS (execOPC, OP1out, OP2out, div_reg, div_neg, div_bit, div_sub, div_quot, OP1_sign, div_over, div_over_s, result_div, reg_QA, opcode, sndOPC, divs, exe_opcode, reg_QB, 
 	     signedOP, nozero, div_qsign, OP2outext, result_div_pre)
 	BEGIN
 		divs <= (opcode(15) AND opcode(8)) OR (NOT opcode(15) AND sndOPC(11));
@@ -1294,7 +1295,11 @@ PROCESS (execOPC, OP1out, OP2out, div_reg, div_neg, div_bit, div_sub, div_quot, 
 		END IF;	
 		
 		IF (((nozero='1' OR div_bit='0') AND signedOP='1' AND (OP2out(31) XOR OP1_sign XOR div_qsign)='1' )	--Overflow DIVS
-			OR (signedOP='0' AND div_over(32)='0')) AND DIV_Mode/=3 THEN	--Overflow DIVU
+			OR (signedOP='0' AND div_over(32)='0')	--Overflow DIVU
+			-- DIVS.L: when the high half of |dividend| is not below |divisor| the
+			-- quotient needs more than 32 bits, and the truncated quotient may
+			-- still have the expected sign (for example (2^63 - 3) / -1)
+			OR (signedOP='1' AND exe_opcode(15)='0' AND DIV_Mode/=0 AND div_over_s(32)='0')) AND DIV_Mode/=3 THEN
 			set_V_Flag <= '1';
 		ELSE	
 			set_V_Flag <= '0';
@@ -1329,6 +1334,12 @@ PROCESS (clk)
 					ELSE	
 						div_over <= ('0'&div_reg(63 downto 32))-('0'&OP2outext(15 downto 0)&OP2out(15 downto 0));
 					END IF;	
+					-- div_reg holds |dividend| here
+					IF OP2out(31)='1' THEN
+						div_over_s <= ('0'&div_reg(63 downto 32))-('0'&(0-OP2out(31 downto 0)));
+					ELSE
+						div_over_s <= ('0'&div_reg(63 downto 32))-('0'&OP2out(31 downto 0));
+					END IF;
 				END IF;
 				IF exec(write_reminder)='0' THEN
 					result_div(31 downto 0) <= result_div_pre;
