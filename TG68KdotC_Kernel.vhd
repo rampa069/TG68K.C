@@ -305,6 +305,8 @@ architecture logic of TG68KdotC_Kernel is
 
 	signal IPL_nr				: std_logic_vector(2 downto 0);
 	signal rIPL_nr				: std_logic_vector(2 downto 0);
+	signal ipl7_last			: bit;			-- IPL was 7 on the previous clock
+	signal nmi_pending			: bit;			-- a rise to level 7 not yet taken
 	signal IPL_vec				: std_logic_vector(7 downto 0);
 	signal interrupt			: bit;
 	signal setinterrupt		: bit;
@@ -993,7 +995,7 @@ PROCESS (clk, setdisp, memaddr_a, briefdata, memaddr_delta, setdispbyte, datatyp
 -----------------------------------------------------------------------------
 -- PC Calc + fetch opcode
 -----------------------------------------------------------------------------
-PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data, next_micro_state, stop, make_trace, make_berr, IPL_nr, FlagsSR, set_rot_cnt, opcode, writePCbig, set_exec, exec,
+PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data, next_micro_state, stop, make_trace, make_berr, IPL_nr, nmi_pending, FlagsSR, set_rot_cnt, opcode, writePCbig, set_exec, exec,
         PC_dataa, PC_datab, setnextpass, last_data_read, TG68_PC_brw, TG68_PC_word, Z_error, trap_trap, trap_trapv, interrupt, tmp_TG68_PC, TG68_PC, use_VBR_Stackframe, writePCnext)
 	BEGIN
 	
@@ -1038,7 +1040,8 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 		setinterrupt <= '0';
 		IF setstate="00" AND next_micro_state=idle AND setnextpass='0' AND (exec_write_back='0' OR state="11") AND set_rot_cnt="000001" AND set_exec(opcCHK)='0'THEN
 			setendOPC <= '1';
-			IF FlagsSR(2 downto 0)<IPL_nr OR IPL_nr="111"  OR make_trace='1' OR make_berr='1' THEN
+			-- level 7 passes the mask only on its rising edge (nmi_pending)
+			IF FlagsSR(2 downto 0)<IPL_nr OR (IPL_nr="111" AND nmi_pending='1') OR make_trace='1' OR make_berr='1' THEN
 				setinterrupt <= '1';
 			ELSIF stop='0' THEN
 				setopcode <= '1';
@@ -1414,6 +1417,35 @@ PROCESS (clk, Reset, FlagsSR, last_data_read, OP2out, exec)
 				FlagsSR(3) <= '0';
 			END IF;
 		END IF;	
+	END PROCESS;
+
+-----------------------------------------------------------------------------
+-- Level 7 is edge-triggered (M68000 User's Manual): an interrupt is
+-- generated each time the request rises to 7 from a lower level, even with
+-- the mask at 7. A held 7 is only taken again through the normal level
+-- comparison, once an instruction lowers the mask below 7. It used to be
+-- taken whenever IPL was 7, so a held request was taken again at the end
+-- of every exception entry and its handler never ran.
+-----------------------------------------------------------------------------
+PROCESS (clk)
+	BEGIN
+		IF rising_edge(clk) THEN
+			IF Reset='1' THEN
+				ipl7_last <= '0';
+				nmi_pending <= '0';
+			ELSE
+				IF IPL_nr="111" THEN
+					ipl7_last <= '1';
+				ELSE
+					ipl7_last <= '0';
+				END IF;
+				IF IPL_nr="111" AND ipl7_last='0' THEN
+					nmi_pending <= '1';
+				ELSIF clkena_lw='1' AND setinterrupt='1' AND make_trace='0' AND make_berr='0' AND IPL_nr="111" THEN
+					nmi_pending <= '0';				-- taken (see trap_interrupt below)
+				END IF;
+			END IF;
+		END IF;
 	END PROCESS;
 
 -----------------------------------------------------------------------------
