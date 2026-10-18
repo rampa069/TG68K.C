@@ -94,6 +94,8 @@ architecture logic of TG68K_ALU is
 	signal flag_z				: std_logic_vector(2 downto 0);
 	signal set_Flags			: std_logic_vector(3 downto 0);	--NZVC
 	signal CCRin				: std_logic_vector(7 downto 0);
+	signal stop_ccr			: std_logic_vector(7 downto 0);	-- CCR from STOP #imm
+	signal stop_ccr_pending	: bit := '0';
 	signal last_Flags1		: std_logic_vector(3 downto 0);	--NZVC
     
 --BCD
@@ -996,8 +998,9 @@ PROCESS (clk, Reset, exe_opcode, exe_datatype, Flags, last_data_read, OP2out, fl
 		IF rising_edge(clk) THEN		
 			IF Reset='1' THEN
 				Flags(7 downto 0) <= "00000000"; 
+				stop_ccr_pending <= '0';
 			ELSIF clkena_lw = '1' THEN
-				IF exec(directSR)='1' OR set_stop='1' THEN
+				IF exec(directSR)='1' THEN
 					Flags(7 downto 0) <= data_read(7 downto 0);
 				END IF;	
 				IF exec(directCCR)='1' THEN
@@ -1099,6 +1102,17 @@ PROCESS (clk, Reset, exe_opcode, exe_datatype, Flags, last_data_read, OP2out, fl
 						Flags(0) <= '0';
 					END IF;
 				END IF;	
+				-- STOP: the immediate is read on the decode edge, the edge on which
+				-- the previous instruction writes its flags (and used to overwrite
+				-- the new CCR). Keep it and load it on the next edge, once that
+				-- write is done; the CPU is stopped by then.
+				IF set_stop='1' THEN
+					stop_ccr <= data_read(7 downto 0);
+					stop_ccr_pending <= '1';
+				ELSIF stop_ccr_pending='1' THEN
+					Flags(7 downto 0) <= stop_ccr;
+					stop_ccr_pending <= '0';
+				END IF;
 			END IF;	
 			Flags(7 downto 5) <= "000";
 		END IF;	
