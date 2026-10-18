@@ -3173,14 +3173,11 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 						IF opcode(5 downto 1)/="11110" THEN
 							IF opcode(11 downto 9)="001" OR opcode(11 downto 9)="010" THEN
 								IF SVmode='1' THEN
-									IF opcode(5 downto 3)="101" THEN
-										--cpRESTORE not implemented
-										trap_illegal <= '1';
-										trapmake <= '1';
-									ELSE
-										trap_1111 <= '1';
-										trapmake <= '1';
-									END IF;
+									-- With no coprocessor every cpRESTORE takes Line-F, as the
+									-- other modes already did; d16(An) used to give ILLEGAL
+									-- ("cpRESTORE not implemented")
+									trap_1111 <= '1';
+									trapmake <= '1';
 								ELSE
 									trap_priv <= '1';
 									trapmake <= '1';
