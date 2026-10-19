@@ -428,6 +428,10 @@ architecture logic of TG68KdotC_Kernel is
 	signal fr_word				: std_logic_vector(31 downto 0);
 	signal ae_frame			: std_logic := '0';
 	signal ae_addr, ae_pc	: std_logic_vector(31 downto 0);
+	-- the stacked PC of the address error is ae_base + ae_off: only a choice
+	-- of registers is latched under the clock enable (which comes late from
+	-- the memory system in MinimigAGA), the addition is made from registers
+	signal ae_base, ae_off	: std_logic_vector(31 downto 0);
 	signal ae_status			: std_logic_vector(15 downto 0);
 	signal ae_ir				: std_logic_vector(15 downto 0);
 	signal ae_sr				: std_logic_vector(15 downto 0);
@@ -4783,10 +4787,11 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		  end if;
 		  if state = "00" then
 			ae_status <= opcode(15 downto 5) & "11" & FlagsSR(5) & "10";	-- program
+			ae_base <= addr;
 			if cpu(1) = '1' then
-			  ae_pc <= addr;		-- 68020: the next instruction (UM table 6-5)
+			  ae_off <= X"00000000";	-- 68020: the next instruction (UM table 6-5)
 			else
-			  ae_pc <= addr - 4;
+			  ae_off <= X"FFFFFFFC";	-- addr - 4
 			end if;
 		  else
 			ae_status <= opcode(15 downto 5) & (NOT state(0)) & '0' & FlagsSR(5) & "01";	-- data
@@ -4794,17 +4799,19 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 			  -- a MOVE has fetched its source extension words, and one more
 			  -- word unless the destination is (An) or (An)+, when its write
 			  -- faults (SingleStepTests 68000)
+			  ae_base <= exe_pc;
 			  if opcode(8 downto 6) = "010" or opcode(8 downto 6) = "011" then
-				ae_pc <= exe_pc + ae_srcext;
+				ae_off <= X"00000000" + ae_srcext;
 			  elsif opcode(11 downto 6) = "001111" and
 					(opcode(5 downto 4) = "00" or opcode(5 downto 0) = "111100") then
 				-- to (xxx).L from a register or immediate data: one more word
-				ae_pc <= exe_pc + 4 + ae_srcext;
+				ae_off <= X"00000004" + ae_srcext;
 			  else
-				ae_pc <= exe_pc + 2 + ae_srcext;
+				ae_off <= X"00000002" + ae_srcext;
 			  end if;
 			else
-			  ae_pc <= TG68_PC - 4;
+			  ae_base <= TG68_PC;
+			  ae_off <= X"FFFFFFFC";		-- TG68_PC - 4
 			end if;
 		  end if;
 		elsif setopcode = '1' and clkena_lw = '1' then
@@ -4857,6 +4864,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 
   ccr_force <= '1' WHEN ae_ccr_force='1' OR micro_state=rte_ferr ELSE '0';
   ccr_val <= rte_ccr(4 downto 0) WHEN micro_state=rte_ferr ELSE ae_ccr;
+  ae_pc <= ae_base + ae_off;
   -- the format error frame: format $0, the PC of the RTE
   process (clk)
   begin
