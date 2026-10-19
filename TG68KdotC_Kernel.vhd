@@ -4472,6 +4472,10 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 			  -- faults (SingleStepTests 68000)
 			  if opcode(8 downto 6) = "010" or opcode(8 downto 6) = "011" then
 				ae_pc <= exe_pc + ae_srcext;
+			  elsif opcode(11 downto 6) = "001111" and
+					(opcode(5 downto 4) = "00" or opcode(5 downto 0) = "111100") then
+				-- to (xxx).L from a register or immediate data: one more word
+				ae_pc <= exe_pc + 4 + ae_srcext;
 			  else
 				ae_pc <= exe_pc + 2 + ae_srcext;
 			  end if;
