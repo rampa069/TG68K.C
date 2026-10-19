@@ -358,6 +358,15 @@ architecture logic of TG68KdotC_Kernel is
 	signal CACR					: std_logic_vector(3 downto 0);
 	signal DFC					: std_logic_vector(2 downto 0);
 	signal SFC					: std_logic_vector(2 downto 0);
+	-- 68040 mode (CPU = "10"): the 68040 CACR and the MMU registers, which
+	-- nothing acts on yet
+	signal cpu010				: std_logic;	-- 68010 or later
+	signal cpu040				: std_logic;
+	signal CACR040				: std_logic_vector(1 downto 0);	-- DE, IE
+	signal TC040				: std_logic;						-- P (E is kept clear)
+	signal ITT0, ITT1, DTT0, DTT1 : std_logic_vector(31 downto 0);
+	signal MMUSR, URP, SRP	: std_logic_vector(31 downto 0);
+	signal movec_ok			: std_logic;
 	
 
 	signal set					: bit_vector(lastOpcBit downto 0);
@@ -440,6 +449,12 @@ ALU: TG68K_ALU
    regin_out <= regin;
 
 
+	-- CPU: 00 68000, 01 68010, 11 68020, 10 68040. The 68040 has every
+	-- 68010 and 68020 feature the core models (cpu(1) set), so the 68010
+	-- checks use cpu010 instead of cpu(0).
+	cpu010 <= cpu(0) OR cpu(1);
+	cpu040 <= cpu(1) AND NOT cpu(0);
+
 	nWr <= '0' WHEN state="11" ELSE '1';
 	busstate <= state;
 	nResetOut <= '0' WHEN exec(opcRESET)='1' ELSE '1';
@@ -464,7 +479,7 @@ ALU: TG68K_ALU
 			END IF;
 		END IF;
 		IF rising_edge(clk) THEN
-			IF VBR_Stackframe=1 or (cpu(0)='1' and VBR_Stackframe=2) THEN
+			IF VBR_Stackframe=1 or (cpu010='1' and VBR_Stackframe=2) THEN
 				use_VBR_Stackframe<='1';
 			ELSE
 				use_VBR_Stackframe<='0';
@@ -1795,7 +1810,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 						trapmake <= '1';
 					END IF;
 				ELSIF opcode(11 downto 9)="111" THEN		--MOVES not in 68000
-					IF cpu(0)='1' AND opcode(7 downto 6)/="11" AND opcode(5 downto 4)/="00" AND (opcode(5 downto 3)/="111" OR opcode(2 downto 1)="00") THEN
+					IF cpu010='1' AND opcode(7 downto 6)/="11" AND opcode(5 downto 4)/="00" AND (opcode(5 downto 3)/="111" OR opcode(2 downto 1)="00") THEN
 						IF SVmode='1' THEN
 							--TODO: implement MOVES
 							trap_illegal <= '1';
@@ -2067,12 +2082,12 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 							IF (opcode(5 downto 3)/="001" AND --ea An illegal mode
 							   (opcode(5 downto 3)/="111" OR opcode(2 downto 1)="00")) THEN --ea illegal modes
 								IF opcode(7 downto 6)="11" THEN					--move from SR
-									IF SR_Read=0 OR (cpu(0)='0' AND SR_Read=2) OR SVmode='1'  THEN
+									IF SR_Read=0 OR (cpu010='0' AND SR_Read=2) OR SVmode='1'  THEN
 										ea_build_now <= '1';
 										set_exec(opcMOVESR) <= '1';
 										datatype <= "01";
 										write_back <='1';							-- im 68000 wird auch erst gelesen
-										IF cpu(0)='1' AND state="10" AND addrvalue='0' THEN
+										IF cpu010='1' AND state="10" AND addrvalue='0' THEN
 											skipFetch <= '1';
 										END IF;
 										IF opcode(5 downto 4)="00" THEN
@@ -2104,7 +2119,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 							IF (opcode(5 downto 3)/="001" AND --ea An illegal mode
 							   (opcode(5 downto 3)/="111" OR opcode(2 downto 1)="00")) THEN --ea illegal modes
 								IF opcode(7 downto 6)="11" THEN					--move from CCR 68010
-									IF SR_Read=1 OR (cpu(0)='1' AND SR_Read=2) THEN
+									IF SR_Read=1 OR (cpu010='1' AND SR_Read=2) THEN
 										ea_build_now <= '1';
 										set_exec(opcMOVESR) <= '1';
 										datatype <= "01";
@@ -2123,7 +2138,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 									ea_build_now <= '1';
 									write_back <='1';
 									set_exec(opcAND) <= '1';
-									IF cpu(0)='1' AND state="10" AND addrvalue='0' THEN
+									IF cpu010='1' AND state="10" AND addrvalue='0' THEN
 										skipFetch <= '1';
 									END IF;
 									IF setexecOPC='1' THEN
@@ -2696,7 +2711,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 							ea_build_now <= '1';
 							write_back <= '1';
 							set_exec(opcScc) <= '1';
-							IF cpu(0)='1' AND state="10" AND addrvalue='0' THEN
+							IF cpu010='1' AND state="10" AND addrvalue='0' THEN
 								skipFetch <= '1';
 							END IF;
 							IF opcode(5 downto 4)="00" THEN
@@ -3871,8 +3886,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 				WHEN movec1 =>		-- MOVEC
 					set(briefext) <= '1';
 					set_writePCbig <='1';
-					IF (brief(11 downto 0)=X"000" OR brief(11 downto 0)=X"001" OR brief(11 downto 0)=X"800" OR brief(11 downto 0)=X"801") OR 
-					   (cpu(1)='1' AND (brief(11 downto 0)=X"002" OR brief(11 downto 0)=X"802" OR brief(11 downto 0)=X"803" OR brief(11 downto 0)=X"804")) THEN
+					IF movec_ok='1' THEN
 						IF opcode(0)='0' THEN
 							set(Regwrena) <= '1';
 						END IF;
@@ -4042,11 +4056,29 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 	  if Reset = '1' then
 		VBR <= (others => '0');
 		CACR <= (others => '0');
+		-- reset clears the CACR and TC E (68040 UM 4.2, 3.1.2); the other
+		-- MMU registers are left alone, as P is
+		CACR040 <= "00";
 	  elsif clkena_lw = '1' and exec(movec_wr) = '1' then
 		case brief(11 downto 0) is
 		  when X"000" => SFC <= reg_QA(2 downto 0); -- SFC -- 68010+
 		  when X"001" => DFC <= reg_QA(2 downto 0); -- DFC -- 68010+
-		  when X"002" => CACR <= reg_QA(3 downto 0); -- 68020+
+		  when X"002" =>
+			if cpu040 = '1' then
+			  CACR040 <= reg_QA(31) & reg_QA(15);   -- DE, IE
+			else
+			  CACR <= reg_QA(3 downto 0); -- 68020+
+			end if;
+		  -- 68040 MMU registers (68040 UM 3.1): unimplemented bits read as 0;
+		  -- TC E stays clear, since the core has no MMU (Emu68 does the same)
+		  when X"003" => TC040 <= reg_QA(14);
+		  when X"004" => ITT0 <= reg_QA and X"FFFFE364";
+		  when X"005" => ITT1 <= reg_QA and X"FFFFE364";
+		  when X"006" => DTT0 <= reg_QA and X"FFFFE364";
+		  when X"007" => DTT1 <= reg_QA and X"FFFFE364";
+		  when X"805" => MMUSR <= reg_QA;
+		  when X"806" => URP <= reg_QA and X"FFFFFE00";
+		  when X"807" => SRP <= reg_QA and X"FFFFFE00";
 		  when X"800" => NULL; -- USP -- 68010+
 		  when X"801" => VBR <= reg_QA; -- 68010+
 		  when X"802" => NULL; -- CAAR -- 68020+
@@ -4061,13 +4093,45 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 	case brief(11 downto 0) is
 		when X"000" => movec_data <= "00000000000000000000000000000" & SFC;
 		when X"001" => movec_data <= "00000000000000000000000000000" & DFC;
-	  when X"002" => movec_data <= "0000000000000000000000000000" & (CACR AND "0011");
+	  when X"002" =>
+		if cpu040 = '1' then
+		  movec_data <= CACR040(1) & "000000000000000" & CACR040(0) & "000000000000000";
+		else
+		  movec_data <= "0000000000000000000000000000" & (CACR AND "0011");
+		end if;
+	  when X"003" => movec_data <= X"0000" & '0' & TC040 & "00000000000000";
+	  when X"004" => movec_data <= ITT0;
+	  when X"005" => movec_data <= ITT1;
+	  when X"006" => movec_data <= DTT0;
+	  when X"007" => movec_data <= DTT1;
+	  when X"805" => movec_data <= MMUSR;
+	  when X"806" => movec_data <= URP;
+	  when X"807" => movec_data <= SRP;
 
 	  when X"801" => 
 		movec_data <= VBR;
 		--end if;
 	  when others => NULL;
 	end case;
+  end process;
+
+  -- control registers MOVEC accepts: the 68010 set, the 68020 additions
+  -- (CAAR, MSP, ISP) and the 68040 set, which drops CAAR (68040 UM appendix D)
+  process (brief, cpu, cpu040)
+	variable c : std_logic_vector(11 downto 0);
+  begin
+	c := brief(11 downto 0);
+	movec_ok <= '0';
+	if c = X"000" or c = X"001" or c = X"800" or c = X"801" then
+	  movec_ok <= '1';
+	elsif cpu(1) = '1' and (c = X"002" or c = X"803" or c = X"804") then
+	  movec_ok <= '1';
+	elsif cpu040 = '0' and cpu(1) = '1' and c = X"802" then
+	  movec_ok <= '1';
+	elsif cpu040 = '1' and (c = X"003" or c = X"004" or c = X"005" or c = X"006" or c = X"007" or
+						   c = X"805" or c = X"806" or c = X"807") then
+	  movec_ok <= '1';
+	end if;
   end process;
 
   CACR_out <= CACR;
