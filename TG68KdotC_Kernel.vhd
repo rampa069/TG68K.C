@@ -4049,7 +4049,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 -----------------------------------------------------------------------------
 -- MOVEC
 -----------------------------------------------------------------------------
-  process (clk, SFC, DFC, VBR, CACR, brief)
+  process (clk, SFC, DFC, VBR, CACR, brief, cpu040, CACR040, TC040, ITT0, ITT1, DTT0, DTT1, MMUSR, URP, SRP)
   begin
 	-- all other hexa codes should give illegal isntruction exception
 	if rising_edge(clk) then
