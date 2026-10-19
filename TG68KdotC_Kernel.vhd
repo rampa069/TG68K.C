@@ -384,6 +384,24 @@ architecture logic of TG68KdotC_Kernel is
 	signal addr_out_core	: std_logic_vector(31 downto 0);
 	-- 68040 MMU (TG68K_MMU) between the core and the bus
 	signal clkena_core		: std_logic;
+	-- address error (68000): ae_now flags the core's access starting in this
+	-- cycle, which is not performed; ae_frame holds until the handler starts,
+	-- for the group 0 frame (MC68000 User's Manual, figure 6-7)
+	signal ae_now				: std_logic;
+	signal ae_frame			: std_logic := '0';
+	signal ae_addr, ae_pc	: std_logic_vector(31 downto 0);
+	signal ae_status			: std_logic_vector(15 downto 0);
+	signal ae_ir				: std_logic_vector(15 downto 0);
+	signal ae_sr				: std_logic_vector(15 downto 0);
+	signal ae_ccr_force		: std_logic;
+	signal ae_ccr				: std_logic_vector(4 downto 0);
+	signal ae_fix				: std_logic;					-- An of the faulting access to correct
+	signal ae_fix_idx			: integer range 0 to 15;
+	signal ae_fix_val			: std_logic_vector(31 downto 0);
+	signal ae_read_done		: std_logic := '0';		-- a data read of this instruction completed
+	signal ae_faddr			: std_logic_vector(31 downto 0);	-- the fault address as the 68000 has it
+	signal ae_move_w			: std_logic;					-- a MOVE whose write faults
+	signal ae_srcext			: integer range 0 to 4;		-- bytes of its source extension words
 	signal TC040E				: std_logic := '0';
 	signal bus_l				: std_logic_vector(1 downto 0);	-- the core's access, logical
 	signal addr_l				: std_logic_vector(31 downto 0);
@@ -481,6 +499,8 @@ ALU: TG68K_ALU
 
 		set_V_Flag => set_V_Flag,			--: buffer bit;
 		Flags => Flags,					 	--: buffer std_logic_vector(8 downto 0);
+		ccr_force => ae_ccr_force,
+		ccr_val => ae_ccr,
 		c_out => c_out,					 	--: buffer std_logic_vector(2 downto 0);
 		addsub_q => addsub_q,				--: buffer std_logic_vector(31 downto 0);
 		ALUout => ALUout						--: buffer std_logic_vector(31 downto 0)
@@ -510,14 +530,23 @@ ALU: TG68K_ALU
 	cpu010 <= cpu(0) OR cpu(1);
 	cpu040 <= cpu(1) AND NOT cpu(0);
 
-	nwr_l <= NOT fpu_bus_wr WHEN fpu_bus_act='1' ELSE
+	-- a word or long data access starts with memmask(5) set and memmask(3)
+	-- clear (byte accesses have memmask(3) set); instruction fetches are
+	-- words. Only the 68000 mode traps; exception processing itself is not
+	-- checked (a second fault there would halt a real 68000).
+	ae_now <= '1' WHEN cpu="00" AND ae_frame='0' AND addr(0)='1' AND fpu_bus_act='0' AND m16_active='0' AND
+	                   (state="00" OR (state(1)='1' AND memmask(5)='1' AND memmask(3)='0')) ELSE '0';
+
+	nwr_l <= '1' WHEN ae_now='1' ELSE
+	       NOT fpu_bus_wr WHEN fpu_bus_act='1' ELSE
 	       '0' WHEN m16_active='1' AND m16_step(3)='1' ELSE
 	       '1' WHEN m16_active='1' ELSE
 	       '0' WHEN state="11" ELSE '1';
 	bus_l <= "11" WHEN fpu_bus_act='1' AND fpu_bus_wr='1' ELSE
 	            "10" WHEN fpu_bus_act='1' ELSE
 	            "11" WHEN m16_active='1' AND m16_step(3)='1' ELSE
-	            "10" WHEN m16_active='1' ELSE state;
+	            "10" WHEN m16_active='1' ELSE
+	            "01" WHEN ae_now='1' ELSE state;
 	addr_l <= fpu_bus_addr WHEN fpu_bus_act='1' ELSE m16_addr WHEN m16_active='1' ELSE addr_out_core;
 	dwr_l <= fpu_bus_wdata WHEN fpu_bus_act='1' ELSE
 	              m16_buf(conv_integer(m16_step(2 downto 0))) WHEN m16_active='1' AND m16_step(3)='1' ELSE data_write_core;
@@ -526,8 +555,8 @@ ALU: TG68K_ALU
 	-- does shift for byte access. note active low me
 	-- should produce address error on 68000
 	memmaskmux <= memmask when addr(0) = '1' else memmask(4 downto 0) & '1';
-	nuds_l <= fpu_uds_n WHEN fpu_bus_act='1' ELSE '0' WHEN m16_active='1' ELSE memmaskmux(5);
-	nlds_l <= fpu_lds_n WHEN fpu_bus_act='1' ELSE '0' WHEN m16_active='1' ELSE memmaskmux(4);
+	nuds_l <= fpu_uds_n WHEN fpu_bus_act='1' ELSE '0' WHEN m16_active='1' ELSE '1' WHEN ae_now='1' ELSE memmaskmux(5);
+	nlds_l <= fpu_lds_n WHEN fpu_bus_act='1' ELSE '0' WHEN m16_active='1' ELSE '1' WHEN ae_now='1' ELSE memmaskmux(4);
 
 	-- through the MMU: table search cycles, a held or quiet access, or the
 	-- access at its physical address
@@ -572,7 +601,7 @@ ALU: TG68K_ALU
 			END IF;
 		END IF;
 	END PROCESS;
-	clkena_lw <= '1' WHEN clkena_core='1' AND memmaskmux(3)='1' ELSE '0';
+	clkena_lw <= '1' WHEN clkena_core='1' AND (memmaskmux(3)='1' OR ae_now='1') ELSE '0';
 	clr_berr <= '1' WHEN setopcode='1' AND trap_berr='1' ELSE '0';
 	
 	PROCESS (clk, nReset)
@@ -678,7 +707,7 @@ PROCESS (long_start, reg_QB, data_write_tmp, exec, data_read, data_write_mux, me
 -----------------------------------------------------------------------------
 -- Registerfile
 -----------------------------------------------------------------------------
-PROCESS (clk, regfile, RDindex_A, RDindex_B, exec, m16_last, m16_inc_x, m16_inc_y, m16_rx, m16_ry,
+PROCESS (clk, regfile, RDindex_A, RDindex_B, exec, m16_last, m16_inc_x, m16_inc_y, m16_rx, m16_ry, ae_fix, ae_fix_idx, ae_fix_val,
 		 fpu_wr_en, fpu_wr_size, fpu_wr_idx, fpu_wr_data)
 	BEGIN
 		reg_QA <= regfile(RDindex_A);
@@ -691,6 +720,9 @@ PROCESS (clk, regfile, RDindex_A, RDindex_B, exec, m16_last, m16_inc_x, m16_inc_
 				RDindex_B <= conv_integer(rf_source_addr(3 downto 0));
 				IF Wwrena='1' THEN
 					regfile(RDindex_A) <= regin;
+				END IF;
+				IF ae_fix='1' THEN
+					regfile(ae_fix_idx) <= ae_fix_val;
 				END IF;
 				IF fpu_wr_en='1' THEN
 					CASE fpu_wr_size IS
@@ -930,7 +962,18 @@ PROCESS (clk)
 					ea_data <= last_data_read;
 				END IF;	
 				
-				IF micro_state=link1 AND opcode(2 downto 0)="111" THEN
+				IF ae_frame='1' AND micro_state=trap0 THEN
+					data_write_tmp <= ae_pc;
+				ELSIF ae_frame='1' AND micro_state=trap2 THEN
+					-- the SR at the fault (after an RTE, the new one)
+					data_write_tmp(15 downto 0) <= ae_sr;
+				ELSIF ae_frame='1' AND micro_state=trap4 THEN
+					data_write_tmp(15 downto 0) <= ae_ir;
+				ELSIF ae_frame='1' AND micro_state=trap5 THEN
+					data_write_tmp <= ae_addr;
+				ELSIF ae_frame='1' AND micro_state=trap6 THEN
+					data_write_tmp(15 downto 0) <= ae_status;
+				ELSIF micro_state=link1 AND opcode(2 downto 0)="111" THEN
 					-- LINK A7: SP - 4 -> SP; An -> (SP), so the pushed value is the
 					-- decremented SP (M68000 PRM, LINK); the predecrement is being
 					-- written to A7 on this edge
@@ -1062,6 +1105,9 @@ PROCESS (clk, setdisp, memaddr_a, briefdata, memaddr_delta, setdispbyte, datatyp
 				IF trap_interrupt='1' or set_vectoraddr = '1' THEN
 					trap_vector(9 downto 0) <= IPL_vec & "00";      --TH
 				END IF;	
+				IF trap_addr_error='1' THEN		-- over a CHK still in exec
+					trap_vector(9 downto 0) <= "00" & X"0C";
+				END IF;
 			END IF;
 		END IF;
 		IF use_VBR_Stackframe='1' THEN
@@ -1321,8 +1367,8 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 						FC(1 downto 0) <= "11";
 					END IF;	
 					
-					IF state="11" THEN
-						exec_write_back <= '0';
+					IF state="11" OR ae_now='1' THEN
+						exec_write_back <= '0';			-- (an aborted read-modify-write too)
 					ELSIF setstate="10" AND setaddrvalue='0' AND write_back='1' THEN
 						exec_write_back <= '1';
 					END IF;	
@@ -1334,6 +1380,10 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 						state <= "11";
 						FC(1 downto 0) <= "01";
 						memmask <= wbmemmask;
+						addrvalue <= '0';
+					ELSIF ae_now='1' THEN
+						state <= "01";
+						memmask <= "111111";
 						addrvalue <= '0';
 					ELSE	
 						state <= setstate;
@@ -1388,7 +1438,13 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 						END IF;
 					END IF;	
 					
-					IF setopcode='1' AND berr='0' THEN
+					IF ae_now='1' THEN
+						-- an address error ends the instruction: as an interrupt does,
+						-- a NOP stands in for its opcode during exception processing
+						-- (ae_ir keeps the real one for the frame)
+						opcode <= X"4E71";
+						nextpass <= '0';
+					ELSIF setopcode='1' AND berr='0' THEN
 						IF state="00" THEN
 							opcode <= data_read(15 downto 0);
 							exe_pc <= tg68_pc;--TH
@@ -1544,6 +1600,9 @@ PROCESS (clk, Reset, FlagsSR, last_data_read, OP2out, exec)
 					make_trace <= '0';
 					FlagsSR(7) <= '0';
 				END IF;
+				IF ae_now='1' THEN
+					FlagsSR(5) <= '1';		-- (an RTE may have loaded a user SR already)
+				END IF;
 				IF set(changeMode)='1' THEN
 					preSVmode <= NOT preSVmode;
 					FlagsSR(5) <= NOT preSVmode;
@@ -1617,7 +1676,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		 datatype, interrupt, c_out, trapmake, rot_cnt, brief, addr, trap_trapv, last_data_in, use_VBR_Stackframe,
 		 long_start, set_datatype, sndOPC, set_exec, exec, ea_build_now, reg_QA, reg_QB, make_berr, trap_berr,
 		 cpu040, m16_done, fpu_ins, fpu_gen, fpu_memea, fpu_fbcc, fpu_unimpl, fpu_done, mmu_ptest_done,
-		 fpu_unimp, fpu_trap2, fpu_ftrap)
+		 fpu_unimp, fpu_trap2, fpu_ftrap, ae_now, ae_frame)
 	BEGIN
 		TG68_PC_brw <= '0';	
 		setstate <= "00";
@@ -4015,7 +4074,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 					setstate <= "11";
 					datatype <= "01";
 					writeSR <= '1';
-					IF trap_berr='1' THEN
+					IF trap_berr='1' OR ae_frame='1' THEN
 						next_micro_state <= trap4;
 					ELSE
 						next_micro_state <= trap3;
@@ -4322,7 +4381,194 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 	
 				WHEN OTHERS => NULL;
 			END CASE;
+
+
+			-- address error: drop what the instruction would do next and start
+			-- exception processing (the frame is pushed by trap0, trap2 and
+			-- trap4-6, as for the 68000 bus error)
+			IF ae_now='1' THEN
+				set <= (OTHERS => '0');
+				set_exec <= (OTHERS => '0');
+				setstate <= "01";
+				next_micro_state <= trap0;
+				trap_addr_error <= '1';
+				trapmake <= '0';
+				trap_illegal <= '0';
+				trap_priv <= '0';
+				trap_1010 <= '0';
+				trap_1111 <= '0';
+				trap_trap <= '0';
+				trap_trapv <= '0';
+				set_Z_error <= '0';
+				set_stop <= '0';
+				writePC <= '0';
+				setstackaddr <= '0';
+				set_vectoraddr <= '0';
+				IF preSVmode='0' THEN
+					set(changeMode) <= '1';
+				END IF;
+			END IF;
+			-- nothing of the aborted instruction may execute during the
+			-- exception processing (its opcode is still decoded)
+			IF ae_frame='1' THEN
+				set_exec <= (OTHERS => '0');
+			END IF;
 	END PROCESS;
+
+-----------------------------------------------------------------------------
+-- Address error frame (68000). Status word: R/W (1 = read), I/N (1 for an
+-- instruction fetch, as the SingleStepTests vectors have it) and the
+-- function code, with bits 15-5 of the instruction register above them
+-- (undefined in the MC68000 User's Manual figure 6-7, the IRD bits on the
+-- chip). The stacked PC: the fault address - 4 for a fetch, TG68_PC - 4
+-- for data; the 68000 stacks a PC "advanced 2-10 bytes beyond" the first
+-- word of the instruction (UM 6.3.9.1).
+-----------------------------------------------------------------------------
+  process (clk)
+  begin
+	if rising_edge(clk) then
+	  if Reset = '1' then
+		ae_frame <= '0';
+	  elsif clkena_core = '1' then
+		if ae_now = '1' then
+		  ae_frame <= '1';
+		  ae_addr <= ae_faddr;
+		  ae_ir <= opcode;
+		  if ae_ccr_force = '1' then
+			ae_sr <= FlagsSR & "000" & ae_ccr;
+		  else
+			ae_sr <= FlagsSR & Flags;
+		  end if;
+		  if state = "00" then
+			ae_status <= opcode(15 downto 5) & "11" & FlagsSR(5) & "10";	-- program
+			ae_pc <= addr - 4;
+		  else
+			ae_status <= opcode(15 downto 5) & (NOT state(0)) & '0' & FlagsSR(5) & "01";	-- data
+			if ae_move_w = '1' then
+			  -- a MOVE has fetched its source extension words, and one more
+			  -- word unless the destination is (An) or (An)+, when its write
+			  -- faults (SingleStepTests 68000)
+			  if opcode(8 downto 6) = "010" or opcode(8 downto 6) = "011" then
+				ae_pc <= exe_pc + ae_srcext;
+			  else
+				ae_pc <= exe_pc + 2 + ae_srcext;
+			  end if;
+			else
+			  ae_pc <= TG68_PC - 4;
+			end if;
+		  end if;
+		elsif setopcode = '1' and clkena_lw = '1' then
+		  ae_frame <= '0';
+		end if;
+		-- the first data read of an instruction (ADDX/SUBX/CMPM: the source)
+		if decodeOPC = '1' then
+		  ae_read_done <= '0';
+		elsif state = "10" and clkena_lw = '1' and ae_now = '0' then
+		  ae_read_done <= '1';
+		end if;
+	  end if;
+	end if;
+  end process;
+
+  -- the 68000 writes a long operand to -(An) low word first (MOVE, MOVEM),
+  -- and ADDX.L/SUBX.L read theirs that way, so the fault address is An - 2
+  -- where TG68K.C starts at An - 4
+  ae_move_w <= '1' WHEN state="11" AND opcode(15 downto 14)="00" AND opcode(13 downto 12)/="00" ELSE '0';
+  ae_faddr <= addr + 2 WHEN memmask(2)='0' AND
+                            ((state="11" AND ae_move_w='1' AND opcode(8 downto 6)="100") OR
+                             (state="11" AND opcode(15 downto 7)="010010001" AND opcode(5 downto 3)="100") OR
+                             -- ADDX.L/SUBX.L -(Ay),-(Ax) read low word first too
+                             (state="10" AND (opcode(15 downto 12)="1101" OR opcode(15 downto 12)="1001") AND
+                              opcode(8 downto 3)="110001")) ELSE addr;
+  process (opcode)
+  begin
+	ae_srcext <= 0;
+	case opcode(5 downto 3) is
+	  when "101" | "110" => ae_srcext <= 2;
+	  when "111" =>
+		case opcode(2 downto 0) is
+		  when "000" | "010" | "011" => ae_srcext <= 2;
+		  when "001" => ae_srcext <= 4;
+		  when "100" =>
+			if opcode(13 downto 12) = "10" then ae_srcext <= 4; else ae_srcext <= 2; end if;
+		  when others => null;
+		end case;
+	  when others => null;
+	end case;
+  end process;
+
+  -- MOVE whose write faults: the 68000 has already set N and Z from the data
+  -- (V and C clear, X kept), as the SingleStepTests vectors show
+  process (ae_now, state, opcode, data_write_muxin, Flags)
+	variable n, z : std_logic;
+  begin
+	ae_ccr_force <= '0';
+	ae_ccr <= Flags(4 downto 0);
+	if ae_now = '1' and state = "11" and opcode(15 downto 14) = "00" and opcode(13 downto 12) /= "00" and
+	   opcode(8 downto 6) /= "001" then
+	  if opcode(13 downto 12) = "10" then
+		n := data_write_muxin(31);
+		if data_write_muxin = X"00000000" then z := '1'; else z := '0'; end if;
+	  else
+		n := data_write_muxin(15);
+		if data_write_muxin(15 downto 0) = X"0000" then z := '1'; else z := '0'; end if;
+	  end if;
+	  ae_ccr_force <= '1';
+	  ae_ccr <= Flags(4) & n & z & "00";
+	end if;
+  end process;
+
+  -- the address register of the faulting access, left as the 68000 leaves
+  -- it (SingleStepTests 68000): -(An) decremented to the fault address,
+  -- (An)+ past the operand on a read and not moved on a write (MOVEM: +2)
+  process (ae_now, state, opcode, addr, memmask, ae_read_done, regfile, ae_faddr)
+	variable mode, reg : std_logic_vector(2 downto 0);
+	variable sz : integer range 2 to 4;
+  begin
+	if memmask(2) = '1' then sz := 2; else sz := 4; end if;
+	if opcode(15 downto 14) = "00" and opcode(13 downto 12) /= "00" and state = "11" then
+	  mode := opcode(8 downto 6); reg := opcode(11 downto 9);		-- MOVE destination
+	elsif ((opcode(15 downto 12) = "1001" or opcode(15 downto 12) = "1101") and opcode(8) = '1' and
+		   opcode(5 downto 4) = "00" and opcode(7 downto 6) /= "11") or
+		  (opcode(15 downto 12) = "1011" and opcode(8) = '1' and opcode(5 downto 3) = "001" and
+		   opcode(7 downto 6) /= "11") then
+	  -- ADDX/SUBX -(Ay),-(Ax) and CMPM (Ay)+,(Ax)+: Ay first, then Ax
+	  if opcode(3) = '1' and opcode(15 downto 12) /= "1011" then mode := "100"; else mode := "011"; end if;
+	  if opcode(15 downto 12) = "1011" then mode := "011"; end if;
+	  if opcode(3) = '0' and opcode(15 downto 12) /= "1011" then mode := "000"; end if;
+	  if ae_read_done = '1' then reg := opcode(11 downto 9); else reg := opcode(2 downto 0); end if;
+	else
+	  mode := opcode(5 downto 3); reg := opcode(2 downto 0);
+	end if;
+	ae_fix <= '0';
+	ae_fix_idx <= 8 + conv_integer(reg);
+	ae_fix_val <= ae_faddr;
+	if ae_now = '1' and state = "00" and opcode(15 downto 6) = "0100111010" then
+	  -- JSR to an odd address: the 68000 faults before pushing the return
+	  -- address, which TG68K.C has pushed already
+	  ae_fix <= '1';
+	  ae_fix_idx <= 15;
+	  ae_fix_val <= regfile(15) + 4;
+	elsif ae_now = '1' and state /= "00" and opcode(15 downto 11) = "01001" and opcode(9 downto 7) = "001" and
+		  mode = "100" then
+	  -- MOVEM -(An): An is only written at the end
+	  ae_fix <= '1';
+	  ae_fix_val <= ae_faddr + 2;
+	elsif ae_now = '1' and state /= "00" then
+	  if mode = "100" then
+		ae_fix <= '1';
+	  elsif mode = "011" then
+		ae_fix <= '1';
+		if state = "10" then
+		  if opcode(15 downto 7) = "010011001" then
+			ae_fix_val <= ae_faddr + 2;					-- MOVEM (An)+
+		  else
+			ae_fix_val <= ae_faddr + sz;
+		  end if;
+		end if;
+	  end if;
+	end if;
+  end process;
 
 -----------------------------------------------------------------------------
 -- 68040 FPU

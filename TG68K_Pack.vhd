@@ -174,6 +174,8 @@ package TG68K_Pack is
 
 		set_V_Flag				: buffer bit;
 		Flags						: buffer std_logic_vector(7 downto 0);
+		ccr_force				: in std_logic := '0';
+		ccr_val					: in std_logic_vector(4 downto 0) := "00000";
 		c_out						: buffer std_logic_vector(2 downto 0);
 		addsub_q					: buffer std_logic_vector(31 downto 0);
 		ALUout					: out std_logic_vector(31 downto 0)

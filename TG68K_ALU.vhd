@@ -71,6 +71,8 @@ generic(
 
 		set_V_Flag				: buffer bit;
 		Flags						: buffer std_logic_vector(7 downto 0);
+		ccr_force				: in std_logic := '0';			-- load ccr_val (address error of a MOVE)
+		ccr_val					: in std_logic_vector(4 downto 0) := "00000";
 		c_out						: buffer std_logic_vector(2 downto 0);
 		addsub_q					: buffer std_logic_vector(31 downto 0);
 		ALUout					: out std_logic_vector(31 downto 0)
@@ -1113,6 +1115,9 @@ PROCESS (clk, Reset, exe_opcode, exe_datatype, Flags, last_data_read, OP2out, fl
 				ELSIF stop_ccr_pending='1' THEN
 					Flags(7 downto 0) <= stop_ccr;
 					stop_ccr_pending <= '0';
+				END IF;
+				IF ccr_force='1' THEN
+					Flags(4 downto 0) <= ccr_val;
 				END IF;
 			END IF;	
 			Flags(7 downto 5) <= "000";
