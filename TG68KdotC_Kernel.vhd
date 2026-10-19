@@ -373,6 +373,7 @@ architecture logic of TG68KdotC_Kernel is
 	signal cpu040				: std_logic;
 	-- (zero at power-up, as FPGA registers are)
 	signal CACR040				: std_logic_vector(1 downto 0) := "00";	-- DE, IE
+	signal cinv040				: std_logic := '0';		-- a CINV or CPUSH ran (until the next decode)
 	signal TC040				: std_logic := '0';				-- P (E is kept clear)
 	signal ITT0, ITT1, DTT0, DTT1 : std_logic_vector(31 downto 0) := (others => '0');
 	signal MMUSR, URP, SRP	: std_logic_vector(31 downto 0) := (others => '0');
@@ -5269,8 +5270,27 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 	end if;
   end process;
 
-  CACR_out <= CACR;
+  -- CACR_out drives the caches outside the core (MinimigAGA: bit 0 enables
+  -- them, a rising edge on bit 3 clears them, as in the 68020 CACR). In the
+  -- 68040 mode bit 0 is DE or IE, and CINV or CPUSH of any cache raises bit 3
+  -- until the next instruction is decoded.
+  CACR_out <= cinv040 & "00" & (CACR040(1) OR CACR040(0)) WHEN cpu040='1' ELSE CACR;
   VBR_out <= VBR;
+  process (clk)
+  begin
+	if rising_edge(clk) then
+	  if Reset = '1' then
+		cinv040 <= '0';
+	  elsif clkena_lw = '1' and decodeOPC = '1' then
+		if cpu040 = '1' and SVmode = '1' and opcode(15 downto 8) = X"F4" and opcode(4 downto 3) /= "00" and
+		   opcode(7 downto 6) /= "00" then
+		  cinv040 <= '1';
+		else
+		  cinv040 <= '0';
+		end if;
+	  end if;
+	end if;
+  end process;
 -----------------------------------------------------------------------------
 -- Conditions
 -----------------------------------------------------------------------------
