@@ -470,7 +470,8 @@ architecture logic of TG68KdotC_Kernel is
 	signal fpu_gen				: std_logic;	-- cpGEN (a command word follows)
 	signal fpu_memea			: std_logic;	-- effective address built by the kernel
 	signal fpu_fbcc				: std_logic;
-	signal fpu_unimpl			: std_logic;	-- the command word of an unimplemented one
+	signal fpu_unimpl			: std_logic;
+	signal fpu_badcmd, fpu_lf	: std_logic;	-- the command word of an unimplemented one
 	signal fpu_start, fpu_done, fpu_jump : std_logic;
 	signal fpu_br : std_logic;
 	signal fpu_unimp, fpu_trap2, fpu_tf : std_logic := '0';
@@ -1080,7 +1081,7 @@ PROCESS (clk)
 					END IF;
 				ELSIF writePC='1' THEN
 					data_write_tmp <= TG68_PC;
-				ELSIF fmt_err='1' AND micro_state=trap1 THEN
+				ELSIF (fmt_err='1' OR fpu_lf='1') AND micro_state=trap1 THEN
 					data_write_tmp <= exe_pc;			-- format error: the RTE
 				ELSIF (fpu_tf='1' OR fpu_tfp='1' OR fpu_tu='1') AND micro_state=trap1 THEN
 					data_write_tmp <= fpu_next_pc;		-- unimplemented FP, FTRAPcc: the next instruction
@@ -1822,7 +1823,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		 SVmode, preSVmode, stop, long_done, ea_only, setstate, addrvalue, execOPC, exec_write_back, exe_datatype,
 		 datatype, interrupt, c_out, trapmake, rot_cnt, brief, addr, trap_trapv, last_data_in, use_VBR_Stackframe,
 		 long_start, set_datatype, sndOPC, set_exec, exec, ea_build_now, reg_QA, reg_QB, make_berr, trap_berr,
-		 cpu040, m16_done, fpu_ins, fpu_gen, fpu_memea, fpu_fbcc, fpu_unimpl, fpu_done, mmu_ptest_done,
+		 cpu040, m16_done, fpu_ins, fpu_gen, fpu_memea, fpu_fbcc, fpu_unimpl, fpu_badcmd, fpu_done, mmu_ptest_done,
 		 fpu_unimp, fpu_trap2, fpu_ftrap, fpu_unsupp, fpu_upost, fpu_trap55)
 	BEGIN
 		TG68_PC_brw <= '0';	
@@ -3526,11 +3527,6 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 					ELSIF opcode(8)='1' AND SVmode='0' THEN
 						trap_priv <= '1';						-- FSAVE, FRESTORE
 						trapmake <= '1';
-					ELSIF decodeOPC='1' AND fpu_gen='1' AND ((opcode(6)='0' AND fpu_unimpl='1') OR
-					      (opcode(6)='1' AND data_read(15 downto 5)/="00000000000")) THEN
-						-- (FScc/FDBcc: the condition word holds only a predicate 0-31)
-						trap_1111 <= '1';						-- left to the M68040FPSP
-						trapmake <= '1';
 					ELSE
 						IF fpu_memea='1' THEN
 							-- the kernel's effective address modes, as PEA builds them;
@@ -4379,7 +4375,15 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 					END IF;
 				WHEN fpu_go =>		-- FPU: TG68K_FPU starts on this edge
 					setstate <= "01";
-					next_micro_state <= fpu_wait;
+					IF fpu_gen='1' AND fpu_badcmd='1' THEN
+						-- not an instruction (FScc/FDBcc: the condition word holds only
+						-- a predicate 0-31): Line-F, left to the M68040FPSP; the FPU
+						-- does not start
+						trap_1111 <= '1';
+						trapmake <= '1';
+					ELSE
+						next_micro_state <= fpu_wait;
+					END IF;
 				WHEN fpu_wait =>
 					setstate <= "01";
 					IF fpu_done='1' AND fpu_unimp='1' THEN
@@ -4955,7 +4959,24 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
   fpu_memea <= '1' WHEN (opcode(5 downto 3)="101" OR opcode(5 downto 3)="110" OR
                          (opcode(5 downto 3)="111" AND opcode(2)='0')) AND fpu_ftrapcc='0' ELSE '0';
   fpu_pred <= exe_opcode(5 downto 0);
-  fpu_start <= '1' WHEN micro_state=fpu_go ELSE '0';
+  fpu_badcmd <= '1' WHEN (opcode(6)='0' AND fpu_unimpl='1') OR (opcode(6)='1' AND sndOPC(15 downto 5)/="00000000000") ELSE '0';
+  fpu_start <= '1' WHEN micro_state=fpu_go AND NOT (fpu_gen='1' AND fpu_badcmd='1') ELSE '0';
+  -- that Line-F stacks the address of the instruction (the effective address
+  -- may have been fetched by then)
+  process (clk)
+  begin
+	if rising_edge(clk) then
+	  if Reset = '1' then
+		fpu_lf <= '0';
+	  elsif clkena_lw = '1' then
+		if micro_state = fpu_go and fpu_gen = '1' and fpu_badcmd = '1' then
+		  fpu_lf <= '1';
+		elsif micro_state = trap3 then
+		  fpu_lf <= '0';
+		end if;
+	  end if;
+	end if;
+  end process;
   fpu_jump <= '1' WHEN micro_state=fpu_end ELSE '0';
   -- FBcc tests its predicate in bra1: a signaling one on a NaN sets BSUN
   fpu_bsun <= '1' WHEN micro_state=bra1 AND cpu040='1' AND exe_opcode(15 downto 7)="111100101" ELSE '0';
@@ -4991,15 +5012,17 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
   fpu_rd_data <= regfile(fpu_rd_idx);
 
   -- the command word of a cpGEN instruction is on data_read during its
-  -- decode; FMOVECR and effective addresses the
-  -- instruction does not allow take Line-F there
-  process (data_read, opcode)
+  -- decode, and is in sndOPC from the next cycle, fpu_go, where FMOVECR and
+  -- effective addresses the instruction does not allow take Line-F (from the
+  -- register: the data bus in the decode logic made a path from the memory
+  -- to every register of the core in MinimigAGA)
+  process (sndOPC, opcode)
 	variable c : std_logic_vector(15 downto 0);
 	variable m : std_logic_vector(2 downto 0);
 	variable r : std_logic_vector(2 downto 0);
 	variable src, single : boolean;
   begin
-	c := data_read(15 downto 0);
+	c := sndOPC;
 	m := opcode(5 downto 3);
 	r := opcode(2 downto 0);
 	fpu_unimpl <= '0';
