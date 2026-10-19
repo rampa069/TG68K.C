@@ -362,11 +362,27 @@ architecture logic of TG68KdotC_Kernel is
 	-- nothing acts on yet
 	signal cpu010				: std_logic;	-- 68010 or later
 	signal cpu040				: std_logic;
-	signal CACR040				: std_logic_vector(1 downto 0);	-- DE, IE
-	signal TC040				: std_logic;						-- P (E is kept clear)
-	signal ITT0, ITT1, DTT0, DTT1 : std_logic_vector(31 downto 0);
-	signal MMUSR, URP, SRP	: std_logic_vector(31 downto 0);
+	-- (zero at power-up, as FPGA registers are)
+	signal CACR040				: std_logic_vector(1 downto 0) := "00";	-- DE, IE
+	signal TC040				: std_logic := '0';				-- P (E is kept clear)
+	signal ITT0, ITT1, DTT0, DTT1 : std_logic_vector(31 downto 0) := (others => '0');
+	signal MMUSR, URP, SRP	: std_logic_vector(31 downto 0) := (others => '0');
 	signal movec_ok			: std_logic;
+	-- MOVE16 (68040): a small bus sequencer copies the 16-byte line while the
+	-- microcode waits in m16_wait
+	type m16_buf_t is array(0 to 7) of std_logic_vector(15 downto 0);
+	signal m16_buf			: m16_buf_t;
+	signal m16_active		: std_logic := '0';
+	signal m16_done			: std_logic := '0';
+	signal m16_step			: std_logic_vector(3 downto 0) := "0000";	-- 0-7 reads, 8-15 writes
+	signal m16_src, m16_dst	: std_logic_vector(31 downto 0);
+	signal m16_lo				: std_logic_vector(15 downto 0);
+	signal m16_addr			: std_logic_vector(31 downto 0);
+	signal m16_last			: std_logic;
+	signal m16_inc_x, m16_inc_y : std_logic;
+	signal m16_rx, m16_ry	: integer range 8 to 15;
+	signal addr_out_core	: std_logic_vector(31 downto 0);
+	signal data_write_core	: std_logic_vector(15 downto 0);
 	
 
 	signal set					: bit_vector(lastOpcBit downto 0);
@@ -455,15 +471,20 @@ ALU: TG68K_ALU
 	cpu010 <= cpu(0) OR cpu(1);
 	cpu040 <= cpu(1) AND NOT cpu(0);
 
-	nWr <= '0' WHEN state="11" ELSE '1';
-	busstate <= state;
+	nWr <= '0' WHEN m16_active='1' AND m16_step(3)='1' ELSE
+	       '1' WHEN m16_active='1' ELSE
+	       '0' WHEN state="11" ELSE '1';
+	busstate <= "11" WHEN m16_active='1' AND m16_step(3)='1' ELSE
+	            "10" WHEN m16_active='1' ELSE state;
+	addr_out <= m16_addr WHEN m16_active='1' ELSE addr_out_core;
+	data_write <= m16_buf(conv_integer(m16_step(2 downto 0))) WHEN m16_active='1' AND m16_step(3)='1' ELSE data_write_core;
 	nResetOut <= '0' WHEN exec(opcRESET)='1' ELSE '1';
 	
 	-- does shift for byte access. note active low me
 	-- should produce address error on 68000
 	memmaskmux <= memmask when addr(0) = '1' else memmask(4 downto 0) & '1';
-	nUDS <= memmaskmux(5);
-	nLDS <= memmaskmux(4);
+	nUDS <= '0' WHEN m16_active='1' ELSE memmaskmux(5);
+	nLDS <= '0' WHEN m16_active='1' ELSE memmaskmux(4);
 	clkena_lw <= '1' WHEN clkena_in='1' AND memmaskmux(3)='1' ELSE '0';
 	clr_berr <= '1' WHEN setopcode='1' AND trap_berr='1' ELSE '0';
 	
@@ -549,28 +570,28 @@ PROCESS (long_start, reg_QB, data_write_tmp, exec, data_read, data_write_mux, me
 		END IF;
 		
 		IF memmaskmux(1)='0' THEN
-			data_write <= data_write_mux(47 downto 32);
+			data_write_core <= data_write_mux(47 downto 32);
 		ELSIF memmaskmux(3)='0' THEN	
-			data_write <= data_write_mux(31 downto 16);
+			data_write_core <= data_write_mux(31 downto 16);
 		ELSE
 -- a single byte shows up on both bus halfs
 			IF memmaskmux(5 downto 4) = "10" THEN
-				data_write <= data_write_mux(7 downto 0) & data_write_mux(7 downto 0);
+				data_write_core <= data_write_mux(7 downto 0) & data_write_mux(7 downto 0);
 			ELSIF memmaskmux(5 downto 4) = "01" THEN
-				data_write <= data_write_mux(15 downto 8) & data_write_mux(15 downto 8);
+				data_write_core <= data_write_mux(15 downto 8) & data_write_mux(15 downto 8);
 			ELSE
-				data_write <= data_write_mux(15 downto 0);
+				data_write_core <= data_write_mux(15 downto 0);
 			END IF;
 		END IF;
 		IF exec(mem_byte)='1' THEN	--movep
-			data_write <= data_write_tmp(15 downto 8) & data_write_tmp(15 downto 8);
+			data_write_core <= data_write_tmp(15 downto 8) & data_write_tmp(15 downto 8);
 		END IF;
 	END PROCESS;
 	
 -----------------------------------------------------------------------------
 -- Registerfile
 -----------------------------------------------------------------------------
-PROCESS (clk, regfile, RDindex_A, RDindex_B, exec)
+PROCESS (clk, regfile, RDindex_A, RDindex_B, exec, m16_last, m16_inc_x, m16_inc_y, m16_rx, m16_ry)
 	BEGIN
 		reg_QA <= regfile(RDindex_A);
 		reg_QB <= regfile(RDindex_B);
@@ -582,6 +603,14 @@ PROCESS (clk, regfile, RDindex_A, RDindex_B, exec)
 				RDindex_B <= conv_integer(rf_source_addr(3 downto 0));
 				IF Wwrena='1' THEN
 					regfile(RDindex_A) <= regin;
+				END IF;
+				IF m16_last='1' THEN
+					IF m16_inc_x='1' THEN
+						regfile(m16_rx) <= regfile(m16_rx) + 16;
+					END IF;
+					IF m16_inc_y='1' AND (m16_inc_x='0' OR m16_ry/=m16_rx) THEN
+						regfile(m16_ry) <= regfile(m16_ry) + 16;
+					END IF;
 				END IF;
 				
 				IF exec(to_USP)='1' THEN
@@ -998,7 +1027,7 @@ PROCESS (clk, setdisp, memaddr_a, briefdata, memaddr_delta, setdispbyte, datatyp
 		memaddr_delta <= memaddr_delta_rega + memaddr_delta_regb;
 		-- if access done, and not aligned, don't increment
 		addr <= memaddr_reg+memaddr_delta;
-		addr_out <= memaddr_reg + memaddr_delta;
+		addr_out_core <= memaddr_reg + memaddr_delta;
 
 		IF use_base='0' THEN
 			memaddr_reg <= (others=>'0');
@@ -1472,7 +1501,8 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		 build_bcd, set_Z_error, trapd, movem_run, last_data_read, set, set_V_Flag, z_error, trap_trace, trap_interrupt,
 		 SVmode, preSVmode, stop, long_done, ea_only, setstate, addrvalue, execOPC, exec_write_back, exe_datatype,
 		 datatype, interrupt, c_out, trapmake, rot_cnt, brief, addr, trap_trapv, last_data_in, use_VBR_Stackframe,
-		 long_start, set_datatype, sndOPC, set_exec, exec, ea_build_now, reg_QA, reg_QB, make_berr, trap_berr)
+		 long_start, set_datatype, sndOPC, set_exec, exec, ea_build_now, reg_QA, reg_QB, make_berr, trap_berr,
+		 cpu040, m16_done)
 	BEGIN
 		TG68_PC_brw <= '0';	
 		setstate <= "00";
@@ -3152,7 +3182,37 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 --				
 ---- 1111 ----------------------------------------------------------------------------		
 			WHEN "1111" =>
-				IF cpu(1)='1' AND opcode(8 downto 6)="100" THEN --cpSAVE
+				-- 68040 instructions outside the FPU (M68040 User's Manual, M68000
+				-- PRM): the core has no caches and no MMU, so CINV, CPUSH,
+				-- PFLUSH and PTEST only check the privilege (PTEST leaves MMUSR
+				-- alone); scope 00 of CINV and CPUSH is not an instruction
+				IF cpu040='1' AND opcode(11 downto 8)="0100" THEN		--CINV, CPUSH
+					IF opcode(4 downto 3)="00" THEN
+						trap_1111 <= '1';
+						trapmake <= '1';
+					ELSIF SVmode='0' THEN
+						trap_priv <= '1';
+						trapmake <= '1';
+					END IF;
+				ELSIF cpu040='1' AND (opcode(11 downto 5)="0101000" OR
+				      (opcode(11 downto 6)="010101" AND opcode(4 downto 3)="01")) THEN	--PFLUSH, PTEST
+					IF SVmode='0' THEN
+						trap_priv <= '1';
+						trapmake <= '1';
+					END IF;
+				ELSIF cpu040='1' AND (opcode(11 downto 3)="011000100" OR opcode(11 downto 5)="0110000") THEN	--MOVE16
+					-- (Ax)+,(Ay)+ has its extension word in sndOPC after the
+					-- decode; the absolute forms fetch the low address word in
+					-- m16_abs. Not privileged.
+					IF decodeOPC='1' THEN
+						IF opcode(5)='1' THEN
+							setstate <= "01";
+							next_micro_state <= m16_go;
+						ELSE
+							next_micro_state <= m16_abs;
+						END IF;
+					END IF;
+				ELSIF cpu(1)='1' AND opcode(8 downto 6)="100" THEN --cpSAVE
 					IF opcode(5 downto 4)/="00" AND opcode(5 downto 3)/="011" AND
 					   (opcode(5 downto 3)/="111" OR opcode(2 downto 1)="00") THEN --ea illegal modes
 						IF opcode(11 downto 9)/="000" THEN
@@ -3885,6 +3945,23 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 					setstackaddr <= '1';
 					set(Regwrena) <= '1';
 					
+				WHEN m16_abs =>		-- MOVE16: fetch the low word of the address
+					setstate <= "01";
+					next_micro_state <= m16_go;
+				WHEN m16_go =>		-- MOVE16: the sequencer starts on this edge
+					setstate <= "01";
+					next_micro_state <= m16_wait;
+				WHEN m16_wait =>
+					setstate <= "01";
+					IF m16_done='1' THEN
+						next_micro_state <= m16_end;
+					ELSE
+						next_micro_state <= m16_wait;
+					END IF;
+				WHEN m16_end =>		-- fetch the next opcode
+					setstate <= "00";
+					next_micro_state <= nop;
+
 				WHEN movec1 =>		-- MOVEC
 					set(briefext) <= '1';
 					set_writePCbig <='1';
@@ -4049,6 +4126,71 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 	END PROCESS;
 
 -----------------------------------------------------------------------------
+-- MOVE16 (68040)
+--   1111 0110 0010 0xxx, 1xxx 0000 0000 0000   (Ax)+,(Ay)+
+--   1111 0110 000o oyyy, address.L              00 (Ay)+,(xxx).L
+--                                               01 (xxx).L,(Ay)+
+--                                               10 (Ay),(xxx).L
+--                                               11 (xxx).L,(Ay)
+-- The line holding each address (low four bits ignored) is read with eight
+-- word reads and written with eight word writes; the post-incremented
+-- registers go up by 16 (once if Ax = Ay), as in Emu68.
+-----------------------------------------------------------------------------
+  m16_rx <= 8 + conv_integer(opcode(2 downto 0));
+  m16_ry <= 8 + conv_integer(sndOPC(14 downto 12)) WHEN opcode(5)='1' ELSE 8 + conv_integer(opcode(2 downto 0));
+  m16_inc_x <= opcode(5);
+  m16_inc_y <= '1' WHEN opcode(5)='1' OR opcode(4)='0' ELSE '0';
+  m16_last <= '1' WHEN m16_active='1' AND m16_step="1111" AND clkena_lw='1' ELSE '0';
+  m16_addr <= m16_src(31 downto 4) & m16_step(2 downto 0) & '0' WHEN m16_step(3)='0' ELSE
+              m16_dst(31 downto 4) & m16_step(2 downto 0) & '0';
+
+  process (clk)
+	variable absaddr, reg : std_logic_vector(31 downto 0);
+  begin
+	if rising_edge(clk) then
+	  if Reset = '1' then
+		m16_active <= '0';
+		m16_done <= '0';
+		m16_step <= "0000";
+	  elsif clkena_lw = '1' then
+		if micro_state = m16_abs then
+		  m16_lo <= data_read(15 downto 0);
+		end if;
+		if micro_state = m16_go then
+		  absaddr := sndOPC & m16_lo;
+		  if opcode(5) = '1' then
+			m16_src <= regfile(m16_rx);
+			m16_dst <= regfile(m16_ry);
+		  else
+			reg := regfile(m16_ry);
+			if opcode(3) = '1' then
+			  m16_src <= absaddr;
+			  m16_dst <= reg;
+			else
+			  m16_src <= reg;
+			  m16_dst <= absaddr;
+			end if;
+		  end if;
+		  m16_active <= '1';
+		  m16_step <= "0000";
+		elsif m16_active = '1' then
+		  if m16_step(3) = '0' then
+			m16_buf(conv_integer(m16_step(2 downto 0))) <= data_in;
+		  end if;
+		  if m16_step = "1111" then
+			m16_active <= '0';
+			m16_done <= '1';
+		  else
+			m16_step <= m16_step + 1;
+		  end if;
+		elsif micro_state /= m16_wait then
+		  m16_done <= '0';
+		end if;
+	  end if;
+	end if;
+  end process;
+
+-----------------------------------------------------------------------------
 -- MOVEC
 -----------------------------------------------------------------------------
   process (clk, SFC, DFC, VBR, CACR, brief, cpu040, CACR040, TC040, ITT0, ITT1, DTT0, DTT1, MMUSR, URP, SRP)
@@ -4058,9 +4200,13 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 	  if Reset = '1' then
 		VBR <= (others => '0');
 		CACR <= (others => '0');
-		-- reset clears the CACR and TC E (68040 UM 4.2, 3.1.2); the other
-		-- MMU registers are left alone, as P is
+		-- reset clears the CACR and the E bits of TC and the TTRs and leaves
+		-- the rest of the MMU registers alone (68040 UM 3.1.2, 8.2.10)
 		CACR040 <= "00";
+		ITT0(15) <= '0';
+		ITT1(15) <= '0';
+		DTT0(15) <= '0';
+		DTT1(15) <= '0';
 	  elsif clkena_lw = '1' and exec(movec_wr) = '1' then
 		case brief(11 downto 0) is
 		  when X"000" => SFC <= reg_QA(2 downto 0); -- SFC -- 68010+
