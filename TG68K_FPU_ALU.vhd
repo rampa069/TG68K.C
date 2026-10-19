@@ -137,6 +137,8 @@ begin
 		variable lim : unsigned(63 downto 0);
 		variable ival : unsigned(63 downto 0);
 		variable nsgn : std_logic;
+		variable mr : unsigned(67 downto 0);
+		variable er : signed(17 downto 0);
 	begin
 		if rising_edge(clk) then
 			if reset = '1' then
@@ -193,7 +195,17 @@ begin
 							ib <= '0'; nb <= '0';
 							if src(63 downto 0) = x"0000000000000000" then zb <= '1'; else zb <= '0'; end if;
 						end if;
-						state <= NORM_A;
+						-- normalized, zero, infinite and NaN operands need no
+						-- normalization: straight to DISPATCH (or NORM_B)
+						if dst(78 downto 64) = "111111111111111" or dst(63) = '1' or dst(63 downto 0) = x"0000000000000000" then
+							if src(78 downto 64) = "111111111111111" or src(63) = '1' or src(63 downto 0) = x"0000000000000000" then
+								state <= DISPATCH;
+							else
+								state <= NORM_B;
+							end if;
+						else
+							state <= NORM_A;
+						end if;
 					end if;
 
 				-- normalize denormal and unnormal operands, 8 or 1 bits a cycle
@@ -515,7 +527,11 @@ begin
 						m_r <= '0' & m_r(67 downto 2) & (m_r(1) or m_r(0));
 						e_r <= e_r + 1;
 					elsif m_r(66) = '1' then
-						state <= DENORM;
+						if e_r >= emin then
+							state <= RND;		-- not tiny: no DENORM step
+						else
+							state <= DENORM;
+						end if;
 					elsif m_r(66 downto 59) = x"00" then
 						m_r <= m_r(59 downto 0) & x"00";
 						e_r <= e_r - 8;
@@ -569,17 +585,28 @@ begin
 						end if;
 					end loop;
 					if up = '1' then
-						m_r <= (m_r and mask) + shift_left(to_unsigned(1, 68), l);
+						mr := (m_r and mask) + shift_left(to_unsigned(1, 68), l);
 					else
-						m_r <= m_r and mask;
+						mr := m_r and mask;
 					end if;
+					-- a carry out of the rounding (what POSTRND did)
+					er := e_r;
+					if mr(67) = '1' then
+						mr := '0' & mr(67 downto 1);
+						er := e_r + 1;
+					end if;
+					m_r <= mr;
+					e_r <= er;
 					if inx = '1' then
 						x_inex <= '1';
 					end if;
 					if tiny = '1' then
 						x_unfl <= '1';
 					end if;
-					state <= POSTRND;
+					state <= PACK;
+					if opi = OP_INT then
+						state <= INT_PACK;
+					end if;
 
 				when POSTRND =>
 					if m_r(67) = '1' then

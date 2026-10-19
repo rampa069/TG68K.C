@@ -140,6 +140,7 @@ architecture rtl of TG68K_FPU is
 	signal mptr : unsigned(31 downto 0);
 
 	signal done_r, unimp_r : std_logic := '0';
+	signal alu_early : std_logic;
 	-- the pending unimplemented instruction, for the FSAVE frame
 	signal unimp_pend : std_logic := '0';
 	signal uop : std_logic;
@@ -322,7 +323,9 @@ architecture rtl of TG68K_FPU is
 		return b(i) & b(i + 1) & b(i + 2) & b(i + 3);
 	end function;
 begin
-	done <= done_r;
+	-- done also in the cycle the arithmetic unit finishes a register result,
+	-- one cycle before ST_FINISH
+	done <= done_r OR alu_early;
 	unimp <= unimp_r;
 	unsupp <= unsupp_r;
 	upost <= upost_r;
@@ -361,6 +364,7 @@ begin
 		end loop;
 		ufr <= f;
 	end process;
+	alu_early <= '1' WHEN state = ST_ALU_WAIT AND alu_done = '1' AND store = '0' ELSE '0';
 	br_take <= br_r;
 	ftrap <= ftrap_r;
 	br_target <= std_logic_vector(brt);
@@ -406,6 +410,7 @@ begin
 		variable v64 : std_logic_vector(63 downto 0);
 		variable fpn : integer range 0 to 7;
 		variable idx : integer range 0 to 11;
+		variable isop : boolean;
 	begin
 		if rising_edge(clk) then
 			if reset = '1' then
@@ -456,6 +461,9 @@ begin
 						pk <= '0';
 						upost_r <= '0';
 						state <= ST_REG;
+						if opcode(8 downto 6) = "000" and cmd(15 downto 13) = "000" then
+							state <= ST_SRC;		-- FPm,FPn: no effective address
+						end if;
 					end if;
 
 				-- An or Dn of the effective address is on rd_data now
@@ -603,6 +611,7 @@ begin
 						-- an operation the 68040 leaves to the FPSP: the source is
 						-- fetched and converted all the same (ST_UNIMP)
 						if ok then uop <= '0'; else uop <= '1'; end if;
+						isop := ok;
 						ok := true;
 						if cls = "010" and fmt = "111" then
 							ok := false;		-- FMOVECR: the kernel took Line-F
@@ -630,7 +639,12 @@ begin
 							fpiar <= iaddr;
 							if cls = "000" then
 								alu_src <= fpr(to_integer(unsigned(cw(12 downto 10))));
-								state <= ST_ALU;
+								if isop then
+									alu_start <= '1';		-- the unit starts now (no ST_ALU)
+									state <= ST_ALU_WAIT;
+								else
+									state <= ST_ALU;
+								end if;
 							elsif mode = "000" then
 								-- Dn: B W L S
 								case fmt is
@@ -794,6 +808,10 @@ begin
 						unimp_pend <= '0';
 					end if;
 					state <= ret_state;
+					if ret_state = ST_ALU and store = '0' and uop = '0' and pk = '0' then
+						alu_start <= '1';			-- with the converted source below
+						state <= ST_ALU_WAIT;
+					end if;
 					if (ret_state = ST_ALU or ret_state = ST_UNIMP) and store = '0' then
 						-- convert the memory or immediate source
 						case fmt is
@@ -888,8 +906,7 @@ begin
 						if store = '1' then
 							state <= ST_STORE;
 						else
-							done_r <= '1';
-							state <= ST_FINISH;
+							state <= ST_FINISH;		-- done was given by alu_early
 						end if;
 					end if;
 
