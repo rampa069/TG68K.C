@@ -930,7 +930,16 @@ PROCESS (clk)
 					ea_data <= last_data_read;
 				END IF;	
 				
-				IF writePC='1' THEN
+				IF micro_state=link1 AND opcode(2 downto 0)="111" THEN
+					-- LINK A7: SP - 4 -> SP; An -> (SP), so the pushed value is the
+					-- decremented SP (M68000 PRM, LINK); the predecrement is being
+					-- written to A7 on this edge
+					IF Wwrena='1' AND RDindex_A=15 THEN
+						data_write_tmp <= regin;
+					ELSE
+						data_write_tmp <= regfile(15);
+					END IF;
+				ELSIF writePC='1' THEN
 					data_write_tmp <= TG68_PC;
 				ELSIF (fpu_tf='1' OR fpu_tfp='1') AND micro_state=trap1 THEN
 					data_write_tmp <= fpu_next_pc;		-- unimplemented FP, FTRAPcc: the next instruction
