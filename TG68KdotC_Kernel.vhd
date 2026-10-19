@@ -131,6 +131,7 @@ entity TG68KdotC_Kernel is
 		nLDS						: out std_logic;
 		busstate					: out std_logic_vector(1 downto 0);	-- 00-> fetch code 10->read data 11->write data 01->no memaccess
 		longword					: out std_logic;
+		newpc						: out std_logic;	-- the PC is about to be loaded (MinimigAGA's prefetch)
 		nResetOut				: out std_logic;
 		FC							: out std_logic_vector(2 downto 0);
 		clr_berr					: out std_logic;
@@ -567,6 +568,11 @@ ALU: TG68K_ALU
 	-- checks use cpu010 instead of cpu(0).
 	cpu010 <= cpu(0) OR cpu(1);
 	cpu040 <= cpu(1) AND NOT cpu(0);
+	-- high when the PC is about to be loaded rather than incremented (as in
+	-- MinimigAGA's TG68KdotC_Kernel_experimental, whose prefetch address
+	-- generator only follows the CPU while it is high), and also for the jump
+	-- after an FPU instruction, the one load of TG68_PC added here
+	newpc <= '1' WHEN exec(directPC)='1' OR exec(ea_to_pc)='1' OR TG68_PC_brw='1' OR fpu_jump='1' ELSE '0';
 
 	-- a word or long data access starts with memmask(5) set and memmask(3)
 	-- clear (byte accesses have memmask(3) set); instruction fetches are
