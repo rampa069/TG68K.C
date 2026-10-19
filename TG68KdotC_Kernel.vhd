@@ -134,11 +134,12 @@ entity TG68KdotC_Kernel is
 		newpc						: out std_logic;	-- the PC is about to be loaded (MinimigAGA's prefetch)
 		-- 32-bit data bus (optional): long_req asks for an aligned long data
 		-- access in one bus cycle, the memory answers long_ack in that cycle
-		-- with the high word on data_in_hi (reads) or takes data_write_hi
-		-- with data_write (writes); with long_ack at '0' nothing changes
+		-- with the low word (address+2) on data_in_lo and the high word on
+		-- data_in as usual (reads), or takes data_write_hi with data_write
+		-- (writes); with long_ack at '0' nothing changes
 		long_req					: out std_logic;
 		long_ack					: in std_logic := '0';
-		data_in_hi				: in std_logic_vector(15 downto 0) := (others => '0');
+		data_in_lo				: in std_logic_vector(15 downto 0) := (others => '0');
 		data_write_hi			: out std_logic_vector(15 downto 0);
 		nResetOut				: out std_logic;
 		FC							: out std_logic_vector(2 downto 0);
@@ -717,7 +718,7 @@ ALU: TG68K_ALU
 		END IF;
 	END PROCESS;
 			
-PROCESS (clk, long_done, last_data_in, data_in, addr, long_start, memmaskmux, memread, memmask, data_read, long_fast, data_in_hi)
+PROCESS (clk, long_done, last_data_in, data_in, addr, long_start, memmaskmux, memread, memmask, data_read, long_fast, data_in_lo)
 	BEGIN
 		IF memmaskmux(4)='0' THEN
 			data_read <= last_data_in(15 downto 0)&data_in;
@@ -728,7 +729,7 @@ PROCESS (clk, long_done, last_data_in, data_in, addr, long_start, memmaskmux, me
 			data_read(31 downto 16) <= (OTHERS=>data_read(15));
 		END IF;	
 		IF long_fast='1' THEN
-			data_read <= data_in_hi & data_in;		-- the whole long at once
+			data_read <= data_in & data_in_lo;		-- the whole long at once
 		END IF;
 		
 		IF rising_edge(clk) THEN	
@@ -752,7 +753,7 @@ PROCESS (clk, long_done, last_data_in, data_in, addr, long_start, memmaskmux, me
 					END IF;
 				END IF;
 				IF long_fast='1' THEN
-					last_data_in <= data_in_hi & data_in;
+					last_data_in <= data_in & data_in_lo;
 				ELSE
 					last_data_in <= last_data_in(15 downto 0)&data_in(15 downto 0);
 				END IF;
