@@ -43,6 +43,7 @@ generic(
 		exe_condition			: in std_logic;
 		exec_tas					: in std_logic;
 		long_start				: in bit;
+		long_fast				: in bit := '0';		-- a long in one bus cycle (MOVEM steps by 4)
 		non_aligned				: in std_logic;
 		check_aligned			: in std_logic;
 		movem_presub			: in bit;
@@ -291,7 +292,7 @@ PROCESS (OP2out, reg_QB, opcode, OP1out, OP1in, exe_datatype, addsub_q, execOPC,
 -----------------------------------------------------------------------------
 -- addsub
 -----------------------------------------------------------------------------
-PROCESS (OP1out, OP2out, execOPC, Flags, long_start, movem_presub, exe_datatype, exec, addsub_a, addsub_b, opaddsub,
+PROCESS (OP1out, OP2out, execOPC, Flags, long_start, long_fast, movem_presub, exe_datatype, exec, addsub_a, addsub_b, opaddsub,
 	     notaddsub_b, add_result, c_in, sndOPC, non_aligned, check_aligned)
 	BEGIN
 		addsub_a <= OP1out;
@@ -314,7 +315,12 @@ PROCESS (OP1out, OP2out, execOPC, Flags, long_start, movem_presub, exe_datatype,
 		IF exec(opcUNPACK)='1' THEN
 			addsub_b(15 downto 0) <= "0000" & OP2out(7 downto 4) & "0000" & OP2out(3 downto 0);
 		ELSIF execOPC='0' AND exec(OP2out_one)='0' AND exec(get_bfoffset)='0'THEN
-			IF long_start='0' AND exe_datatype="00" AND exec(use_SP)='0' THEN
+			IF long_fast='1' AND exec(movem_action)='1' THEN
+				-- MOVEM with the long in one bus cycle: the next register is 4
+				-- bytes on (or, for -(An), 4 bytes down: the two word cycles add
+				-- 2 and subtract 6)
+				addsub_b <= "00000000000000000000000000000100";
+			ELSIF long_start='0' AND exe_datatype="00" AND exec(use_SP)='0' THEN
 				addsub_b <= "00000000000000000000000000000001";
 			ELSIF long_start='0' AND exe_datatype="10" AND (exec(presub) OR exec(postadd) OR movem_presub)='1' THEN
 				IF exec(movem_action)='1' THEN

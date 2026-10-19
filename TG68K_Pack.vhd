@@ -145,6 +145,7 @@ package TG68K_Pack is
 		exe_condition			: in std_logic;
 		exec_tas					: in std_logic;
 		long_start				: in bit;
+		long_fast				: in bit := '0';		-- a long in one bus cycle (MOVEM steps by 4)
 		non_aligned				: in std_logic;
 		check_aligned			: in std_logic;
 		movem_presub			: in bit;

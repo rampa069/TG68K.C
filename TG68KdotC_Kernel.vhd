@@ -533,6 +533,7 @@ ALU: TG68K_ALU
 		exe_condition => exe_condition,	--: in std_logic;
 		exec_tas => exec_tas,				--: in std_logic;
 		long_start => long_start_alu,		--: in bit;
+		long_fast => to_bit(long_fast),
 		non_aligned => non_aligned,
 		check_aligned => check_aligned,
 		movem_presub => movem_presub,		--: in bit;
@@ -574,11 +575,11 @@ ALU: TG68K_ALU
 	
 	-- a long data access that can be done in one bus cycle: the first word
 	-- of a long (memmaskmux(3) clear, not a 3-word bit field access), aligned
-	-- to 4 bytes, by the core itself, and not a MOVEM or a sequence that steps
-	-- the address word by word (mem_addsub), whose next address assumes two
-	-- word cycles
+	-- to 4 bytes, by the core itself, and not a sequence that steps the
+	-- address word by word (mem_addsub), whose next address assumes two word
+	-- cycles, other than MOVEM (whose step the ALU makes 4 with long_fast)
 	long_req_i <= '1' WHEN state(1)='1' AND memmaskmux(3)='0' AND memmaskmux(1)='1' AND addr(1 downto 0)="00" AND
-	                       fpu_bus_act='0' AND m16_active='0' AND exec(movem_action)='0' AND exec(mem_addsub)='0' AND
+	                       fpu_bus_act='0' AND m16_active='0' AND (exec(movem_action)='1' OR exec(mem_addsub)='0') AND
 	                       mmu_stall='0' AND mmu_bact='0' AND mmu_quiet='0' ELSE '0';	-- (only a cycle of the core on the bus)
 	long_req <= long_req_i;
 	long_fast <= long_req_i AND long_ack;
@@ -1321,7 +1322,7 @@ PROCESS (clk, setdisp, memaddr_a, briefdata, memaddr_delta, setdispbyte, datatyp
 					
 		-- only used for movem address update
 --					IF (long_done='0' AND state(1)='1') OR movem_presub='0' THEN
-					if ((memread(0) = '1') and state(1) = '1') or movem_presub = '0' then -- fix for unaligned movem mikej
+					if ((memread(0) = '1' or long_fast = '1') and state(1) = '1') or movem_presub = '0' then -- fix for unaligned movem mikej
 						memaddr <= addr;
 					END IF;
 			END IF;
