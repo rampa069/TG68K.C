@@ -534,8 +534,11 @@ ALU: TG68K_ALU
 	-- clear (byte accesses have memmask(3) set); instruction fetches are
 	-- words. Only the 68000 mode traps; exception processing itself is not
 	-- checked (a second fault there would halt a real 68000).
-	ae_now <= '1' WHEN cpu="00" AND ae_frame='0' AND addr(0)='1' AND fpu_bus_act='0' AND m16_active='0' AND
-	                   (state="00" OR (state(1)='1' AND memmask(5)='1' AND memmask(3)='0')) ELSE '0';
+	-- the 68040 traps only an instruction prefetch at an odd address (M68040
+	-- User's Manual 8.2.2); its data accesses may be misaligned
+	ae_now <= '1' WHEN ae_frame='0' AND addr(0)='1' AND fpu_bus_act='0' AND m16_active='0' AND
+	                   ((cpu="00" AND (state="00" OR (state(1)='1' AND memmask(5)='1' AND memmask(3)='0'))) OR
+	                    (cpu040='1' AND state="00")) ELSE '0';
 
 	nwr_l <= '1' WHEN ae_now='1' ELSE
 	       NOT fpu_bus_wr WHEN fpu_bus_act='1' ELSE
@@ -962,7 +965,12 @@ PROCESS (clk)
 					ea_data <= last_data_read;
 				END IF;	
 				
-				IF ae_frame='1' AND micro_state=trap0 THEN
+				IF ae_frame='1' AND cpu040='1' AND micro_state=trap00 THEN
+					data_write_tmp <= ae_addr(31 downto 1) & '0';	-- 68040: format $2, A0 cleared
+					useStackframe2 <= '1';
+				ELSIF ae_frame='1' AND cpu040='1' AND micro_state=trap1 THEN
+					data_write_tmp <= exe_pc;				-- the instruction that caused it
+				ELSIF ae_frame='1' AND cpu040='0' AND micro_state=trap0 THEN
 					data_write_tmp <= ae_pc;
 				ELSIF ae_frame='1' AND micro_state=trap2 THEN
 					-- the SR at the fault (after an RTE, the new one)
@@ -4074,7 +4082,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 					setstate <= "11";
 					datatype <= "01";
 					writeSR <= '1';
-					IF trap_berr='1' OR ae_frame='1' THEN
+					IF trap_berr='1' OR (ae_frame='1' AND cpu="00") THEN
 						next_micro_state <= trap4;
 					ELSE
 						next_micro_state <= trap3;
@@ -4390,7 +4398,11 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 				set <= (OTHERS => '0');
 				set_exec <= (OTHERS => '0');
 				setstate <= "01";
-				next_micro_state <= trap0;
+				IF cpu040='1' THEN
+					next_micro_state <= trap00;		-- format $2
+				ELSE
+					next_micro_state <= trap0;
+				END IF;
 				trap_addr_error <= '1';
 				trapmake <= '0';
 				trap_illegal <= '0';
@@ -4543,7 +4555,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 	ae_fix <= '0';
 	ae_fix_idx <= 8 + conv_integer(reg);
 	ae_fix_val <= ae_faddr;
-	if ae_now = '1' and state = "00" and opcode(15 downto 6) = "0100111010" then
+	if ae_now = '1' and cpu = "00" and state = "00" and opcode(15 downto 6) = "0100111010" then
 	  -- JSR to an odd address: the 68000 faults before pushing the return
 	  -- address, which TG68K.C has pushed already
 	  ae_fix <= '1';
