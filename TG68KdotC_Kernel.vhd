@@ -399,20 +399,29 @@ architecture logic of TG68KdotC_Kernel is
 	-- for the group 0 frame (MC68000 User's Manual, figure 6-7)
 	signal ae_now				: std_logic;
 	-- 68040 access error (MMU fault): acc_now flags a faulting access of the
-	-- core or the FPU in this cycle; acc_restart aborts the instruction (the
-	-- registers go back to rf_shadow, taken at its decode); acc_nextop is a
-	-- fault on the fetch of the next opcode, which becomes a NOP while the
-	-- current instruction completes, and acc_go takes the exception at the
-	-- decode of that NOP. xc_now is any of the exception entries that end the
-	-- instruction at once (address error or access error).
-	signal acc_now, acc_restart, acc_nextop, acc_go, xc_now, endop_raw : std_logic;
-	signal acc_frame, acc_pend	: std_logic := '0';
+	-- core or the FPU in this cycle. A data access aborts the instruction at
+	-- once (acc_restart: the registers go back to rf_shadow, taken at its
+	-- decode). A fetch is only noted (acc_fpend), and the cycle after says
+	-- what it was, from registers alone (the decode logic would put the data
+	-- bus on the path to every register): with decodeOPC it was the next
+	-- opcode, the instruction before has completed and acc_go takes the
+	-- exception with that opcode's address; otherwise it was a word of the
+	-- current instruction, which acc_late aborts and restarts; an interrupt
+	-- taken instead drops the fault (the fetch is made again). xc_now is any
+	-- of the entries that end the instruction at once (address or access
+	-- error).
+	signal acc_now, acc_restart, acc_late, acc_go, xc_now : std_logic;
+	signal acc_frame, acc_fpend	: std_logic := '0';
 	signal acc_pc, acc_fa		: std_logic_vector(31 downto 0);
 	signal acc_ssw				: std_logic_vector(15 downto 0);
 	signal acc_srh				: std_logic_vector(7 downto 0);
 	signal acc_ccr				: std_logic_vector(7 downto 0);
 	signal acc_lw2				: std_logic := '0';		-- the first word of a long access is done
 	signal rf_shadow			: regfile_t;
+	-- A7 after an RTE format error (- 8) or a format $7 frame (+ 52), and
+	-- MOVE16's An + 16, worked out a state earlier so that the register file
+	-- inputs take registers and no adder
+	signal sp_adj, m16_ax, m16_ay	: std_logic_vector(31 downto 0);
 	-- the frame words of the address and access errors, from registers only,
 	-- so that they add one level to the data_write_tmp path
 	signal fr_sel, fr_lo, fr_sf2	: std_logic;
@@ -587,20 +596,15 @@ ALU: TG68K_ALU
 
 	-- an MMU fault on an access of the core or the FPU (not MOVE16, not during
 	-- exception processing: a fault there is not reported)
-	-- (nor while one for the next opcode is pending: the prefetch during the
-	-- decode of its NOP faults on the same page)
+	-- (nor while a fetch fault is pending)
 	acc_now <= '1' WHEN cpu040='1' AND mmu_quiet='1' AND m16_active='0' AND ae_frame='0' AND acc_frame='0' AND
-	                    acc_pend='0' ELSE '0';
-	endop_raw <= '1' WHEN setstate="00" AND next_micro_state=idle AND setnextpass='0' AND (exec_write_back='0' OR state="11") AND
-	                      set_rot_cnt="000001" AND set_exec(opcCHK)='0' ELSE '0';
-	-- (if an interrupt is taken instead, the fetched word is not used and
-	-- the fault is not reported; the fetch is made again after it)
-	acc_nextop <= '1' WHEN acc_now='1' AND state="00" AND setopcode='1' ELSE '0';
-	acc_restart <= '1' WHEN acc_now='1' AND NOT (state="00" AND endop_raw='1') ELSE '0';
-	acc_go <= '1' WHEN acc_pend='1' AND decodeOPC='1' ELSE '0';
+	                    acc_fpend='0' ELSE '0';
+	acc_go <= '1' WHEN acc_fpend='1' AND decodeOPC='1' ELSE '0';
+	acc_late <= '1' WHEN acc_fpend='1' AND decodeOPC='0' AND interrupt='0' ELSE '0';
+	acc_restart <= '1' WHEN (acc_now='1' AND state/="00") OR acc_late='1' ELSE '0';
 	xc_now <= ae_now OR acc_restart OR acc_go;
 
-	nwr_l <= '1' WHEN ae_now='1' ELSE
+	nwr_l <= '1' WHEN ae_now='1' OR acc_fpend='1' ELSE
 	       NOT fpu_bus_wr WHEN fpu_bus_act='1' ELSE
 	       '0' WHEN m16_active='1' AND m16_step(3)='1' ELSE
 	       '1' WHEN m16_active='1' ELSE
@@ -609,7 +613,7 @@ ALU: TG68K_ALU
 	            "10" WHEN fpu_bus_act='1' ELSE
 	            "11" WHEN m16_active='1' AND m16_step(3)='1' ELSE
 	            "10" WHEN m16_active='1' ELSE
-	            "01" WHEN ae_now='1' ELSE state;
+	            "01" WHEN ae_now='1' OR acc_fpend='1' ELSE state;
 	addr_l <= fpu_bus_addr WHEN fpu_bus_act='1' ELSE m16_addr WHEN m16_active='1' ELSE addr_out_core;
 	dwr_l <= fpu_bus_wdata WHEN fpu_bus_act='1' ELSE
 	              m16_buf(conv_integer(m16_step(2 downto 0))) WHEN m16_active='1' AND m16_step(3)='1' ELSE data_write_core;
@@ -618,8 +622,8 @@ ALU: TG68K_ALU
 	-- does shift for byte access. note active low me
 	-- should produce address error on 68000
 	memmaskmux <= memmask when addr(0) = '1' else memmask(4 downto 0) & '1';
-	nuds_l <= fpu_uds_n WHEN fpu_bus_act='1' ELSE '0' WHEN m16_active='1' ELSE '1' WHEN ae_now='1' ELSE memmaskmux(5);
-	nlds_l <= fpu_lds_n WHEN fpu_bus_act='1' ELSE '0' WHEN m16_active='1' ELSE '1' WHEN ae_now='1' ELSE memmaskmux(4);
+	nuds_l <= fpu_uds_n WHEN fpu_bus_act='1' ELSE '0' WHEN m16_active='1' ELSE '1' WHEN ae_now='1' OR acc_fpend='1' ELSE memmaskmux(5);
+	nlds_l <= fpu_lds_n WHEN fpu_bus_act='1' ELSE '0' WHEN m16_active='1' ELSE '1' WHEN ae_now='1' OR acc_fpend='1' ELSE memmaskmux(4);
 
 	-- through the MMU: table search cycles, a held or quiet access, or the
 	-- access at its physical address
@@ -784,9 +788,16 @@ PROCESS (clk, regfile, RDindex_A, RDindex_B, exec, m16_last, m16_inc_x, m16_inc_
 				IF Wwrena='1' THEN
 					regfile(RDindex_A) <= regin;
 				END IF;
-				IF micro_state=rte_ferr THEN
-					regfile(15) <= regfile(15) - 8;		-- the frame stays on the stack
+				IF micro_state=rte_ferr0 THEN
+					sp_adj <= regfile(15) - 8;			-- the frame stays on the stack
+				ELSIF micro_state=rte_f7 THEN
+					sp_adj <= regfile(15) + 52;			-- the rest of a format $7 frame
 				END IF;
+				IF micro_state=rte_ferr OR micro_state=rte_f7b THEN
+					regfile(15) <= sp_adj;
+				END IF;
+				m16_ax <= regfile(m16_rx) + 16;
+				m16_ay <= regfile(m16_ry) + 16;
 				IF ae_fix_r='1' AND micro_state=ae_fix1 AND acc_frame='0' THEN
 					regfile(ae_fix_idx_r) <= ae_fix_val_r;
 				END IF;
@@ -799,19 +810,16 @@ PROCESS (clk, regfile, RDindex_A, RDindex_B, exec, m16_last, m16_inc_x, m16_inc_
 				END IF;
 				IF m16_last='1' THEN
 					IF m16_inc_x='1' THEN
-						regfile(m16_rx) <= regfile(m16_rx) + 16;
+						regfile(m16_rx) <= m16_ax;
 					END IF;
 					IF m16_inc_y='1' AND (m16_inc_x='0' OR m16_ry/=m16_rx) THEN
-						regfile(m16_ry) <= regfile(m16_ry) + 16;
+						regfile(m16_ry) <= m16_ay;
 					END IF;
 				END IF;
 				
 				IF exec(to_USP)='1' THEN
 					USP <= reg_QA;
 				END IF;	
-				IF micro_state=rte_f7 THEN
-					regfile(15) <= regfile(15) + 52;		-- the rest of a format $7 frame
-				END IF;
 				-- the registers as they were before the instruction: taken on its
 				-- decode edge, with the write-back of the previous instruction
 				-- landing on that edge merged in; an access error puts them back
@@ -1555,11 +1563,7 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 						nextpass <= '0';
 					ELSIF setopcode='1' AND berr='0' THEN
 						IF state="00" THEN
-							IF acc_nextop='1' THEN
-								opcode <= X"4E71";		-- the fetch faulted: a NOP, then acc_go
-							ELSE
-								opcode <= data_read(15 downto 0);
-							END IF;
+							opcode <= data_read(15 downto 0);
 							exe_pc <= tg68_pc;--TH
 						ELSE
 							opcode <= last_opc_read(15 downto 0);
@@ -4309,7 +4313,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 					   not (cpu(1)='1' and last_data_in(15 downto 12)="0010") and
 					   not (cpu040='1' and last_data_in(15 downto 12)="0011") then
 						setstate <= "01";
-						next_micro_state <= rte_ferr;
+						next_micro_state <= rte_ferr0;
 					elsif last_data_in(15 downto 12)="0010" or last_data_in(15 downto 12)="0011" then
 										  -- read another 32 bits in this case
 						setstate <= "10"; -- read
@@ -4341,8 +4345,14 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 					ELSE
 						next_micro_state <= mmu_ptest2;
 					END IF;
-				WHEN rte_f7 =>		-- RTE of a format $7 frame: A7 + 52 on this edge
+				WHEN rte_f7 =>		-- RTE of a format $7 frame: A7 + 52 worked out
+					setstate <= "01";
+					next_micro_state <= rte_f7b;
+				WHEN rte_f7b =>		-- and written
 					next_micro_state <= nop;
+				WHEN rte_ferr0 =>	-- RTE format error: A7 - 8 worked out
+					setstate <= "01";
+					next_micro_state <= rte_ferr;
 				WHEN rte_ferr =>	-- RTE format error: SP, SR and CCR back, then vector 14
 					trap_fmt <= '1';
 					trapmake <= '1';
@@ -4637,7 +4647,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 	if rising_edge(clk) then
 	  if Reset = '1' then
 		acc_frame <= '0';
-		acc_pend <= '0';
+		acc_fpend <= '0';
 		acc_lw2 <= '0';
 	  elsif clkena_core = '1' then
 		if state(1) = '1' and memmaskmux(3) = '0' and clkena_lw = '0' then
@@ -4663,17 +4673,20 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 			acc_fa <= addr_l;
 		  end if;
 		end if;
-		if acc_restart = '1' then
+		if acc_now = '1' and state = "00" then
+		  acc_fpend <= '1';				-- a fetch: decided in the next cycle
+		elsif acc_restart = '1' and clkena_lw = '1' then
+		  acc_fpend <= '0';
 		  acc_frame <= '1';
-		  acc_pc <= exe_pc;
+		  acc_pc <= exe_pc;				-- the instruction restarts
 		  acc_srh <= FlagsSR;
-		elsif acc_nextop = '1' then
-		  acc_pend <= '1';
-		  acc_pc <= addr_l;
 		elsif acc_go = '1' and clkena_lw = '1' then
-		  acc_pend <= '0';
+		  acc_fpend <= '0';
 		  acc_frame <= '1';
+		  acc_pc <= acc_fa;				-- the next instruction, at the faulting fetch
 		  acc_srh <= FlagsSR;
+		elsif acc_fpend = '1' and interrupt = '1' then
+		  acc_fpend <= '0';				-- not used: an interrupt was taken instead
 		elsif setopcode = '1' and clkena_lw = '1' then
 		  acc_frame <= '0';
 		end if;

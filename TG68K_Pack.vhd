@@ -34,7 +34,7 @@ package TG68K_Pack is
 						  trap4, trap5, trap6, movec1, movep1, movep2, movep3, movep4, movep5, rota1, bf1, 
 						  mul1, mul2, mul_end1,  mul_end2, div1, div2, div3, div4, div_end1, div_end2,
 						  m16_abs, m16_go, m16_wait, m16_end,
-						  fpu_go, fpu_wait, fpu_end, mmu_ptest1, mmu_ptest2, ae_fix1, rte_ferr, ae_push, rte_f7);
+						  fpu_go, fpu_wait, fpu_end, mmu_ptest1, mmu_ptest2, ae_fix1, rte_ferr, ae_push, rte_f7, rte_f7b, rte_ferr0);
 	
 	constant opcMOVE				: integer := 0; --
 	constant opcMOVEQ				: integer := 1; --
