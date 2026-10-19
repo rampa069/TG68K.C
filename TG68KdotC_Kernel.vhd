@@ -114,7 +114,10 @@ entity TG68KdotC_Kernel is
 		BitField : integer := 2;			--0=>no,			1=>yes,				2=>switchable with CPU(1) 
 		
 		BarrelShifter : integer := 1;		--0=>no,			1=>yes,				2=>switchable with CPU(1)  
-		MUL_Hardware : integer := 1		--0=>no,			1=>yes,  
+		MUL_Hardware : integer := 1;		--0=>no,			1=>yes,  
+		-- 1 keeps the MiSTer Minimig data cache switch, bit 8 of the 68020 CACR
+		-- (the 68030 ED bit), readable and driving D_CACHE_out
+		D_Cache_Bit : integer := 0
 		);
 	port(clk						: in std_logic;
 		nReset					: in std_logic;			--low active
@@ -148,6 +151,7 @@ entity TG68KdotC_Kernel is
 		skipFetch				: out std_logic;
 		regin_out				: out std_logic_vector(31 downto 0);
 		CACR_out					: out std_logic_vector( 3 downto 0);
+		D_CACHE_out				: out std_logic;	-- data cache enable (CACR bit 8, or DE in the 68040 mode)
 		VBR_out					: out std_logic_vector(31 downto 0)
 		);
 end TG68KdotC_Kernel;
@@ -382,6 +386,8 @@ architecture logic of TG68KdotC_Kernel is
 	signal cpu040				: std_logic;
 	-- (zero at power-up, as FPGA registers are)
 	signal CACR040				: std_logic_vector(1 downto 0) := "00";	-- DE, IE
+	signal CACR_DC				: std_logic;
+	signal CACR_DC_owned		: std_logic;
 	signal cinv040				: std_logic := '0';		-- a CINV or CPUSH ran (until the next decode)
 	signal TC040				: std_logic := '0';				-- P (E is kept clear)
 	signal ITT0, ITT1, DTT0, DTT1 : std_logic_vector(31 downto 0) := (others => '0');
@@ -5255,13 +5261,15 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 -----------------------------------------------------------------------------
 -- MOVEC
 -----------------------------------------------------------------------------
-  process (clk, SFC, DFC, VBR, CACR, brief, cpu040, CACR040, TC040, TC040E, ITT0, ITT1, DTT0, DTT1, MMUSR, URP, SRP)
+  process (clk, SFC, DFC, VBR, CACR, CACR_DC, brief, cpu040, CACR040, TC040, TC040E, ITT0, ITT1, DTT0, DTT1, MMUSR, URP, SRP)
   begin
 	-- all other hexa codes should give illegal isntruction exception
 	if rising_edge(clk) then
 	  if Reset = '1' then
 		VBR <= (others => '0');
 		CACR <= (others => '0');
+		CACR_DC <= '1';
+		CACR_DC_owned <= '0';
 		-- reset clears the CACR and the E bits of TC and the TTRs and leaves
 		-- the rest of the MMU registers alone (68040 UM 3.1.2, 8.2.10)
 		CACR040 <= "00";
@@ -5281,6 +5289,8 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 			  CACR040 <= reg_QA(31) & reg_QA(15);   -- DE, IE
 			else
 			  CACR <= reg_QA(3 downto 0); -- 68020+
+			  CACR_DC <= reg_QA(8);
+			  CACR_DC_owned <= '1';
 			end if;
 		  -- 68040 MMU registers (68040 UM 3.1): unimplemented bits read as 0
 		  when X"003" => TC040 <= reg_QA(14); TC040E <= reg_QA(15);
@@ -5310,6 +5320,9 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		  movec_data <= CACR040(1) & "000000000000000" & CACR040(0) & "000000000000000";
 		else
 		  movec_data <= "0000000000000000000000000000" & (CACR AND "0011");
+		  if D_Cache_Bit = 1 then
+			movec_data(8) <= CACR_DC;
+		  end if;
 		end if;
 	  when X"003" => movec_data <= X"0000" & TC040E & TC040 & "00000000000000";
 	  when X"004" => movec_data <= ITT0;
@@ -5353,6 +5366,9 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
   CACR_out <= cinv040 & "00" & (CACR040(1) OR CACR040(0)) WHEN cpu040='1' ELSE CACR;
   data_write_hi <= data_write_mux(31 downto 16);		-- the high word of a long in one cycle
   VBR_out <= VBR;
+  -- the data cache stays on until software writes the CACR (MiSTer Minimig)
+  D_CACHE_out <= CACR040(1) WHEN cpu040='1' ELSE
+                 CACR_DC OR NOT CACR_DC_owned WHEN D_Cache_Bit = 1 ELSE '1';
   process (clk)
   begin
 	if rising_edge(clk) then
