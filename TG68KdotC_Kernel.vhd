@@ -285,6 +285,10 @@ architecture logic of TG68KdotC_Kernel is
 	signal trap_1010			: bit;
 	signal trap_1111			: bit;
 	signal trap_fmt			: bit;					-- RTE with a frame format it cannot restore
+	signal trap_unsupp		: bit;					-- FP unsupported data type, vector 55
+	signal fpu_unsupp, fpu_upost : std_logic;
+	signal fpu_trap55			: std_logic;
+	signal fpu_tu				: std_logic := '0';		-- its exception entry
 	signal fmt_err				: std_logic := '0';		-- the format error frame is being built
 	signal rte_ccr				: std_logic_vector(7 downto 0);	-- the CCR before an RTE
 	signal rte_sr				: std_logic_vector(7 downto 0);	-- the SR before an RTE
@@ -1023,12 +1027,12 @@ PROCESS (clk)
 					data_write_tmp <= TG68_PC;
 				ELSIF fmt_err='1' AND micro_state=trap1 THEN
 					data_write_tmp <= exe_pc;			-- format error: the RTE
-				ELSIF (fpu_tf='1' OR fpu_tfp='1') AND micro_state=trap1 THEN
+				ELSIF (fpu_tf='1' OR fpu_tfp='1' OR fpu_tu='1') AND micro_state=trap1 THEN
 					data_write_tmp <= fpu_next_pc;		-- unimplemented FP, FTRAPcc: the next instruction
 				ELSIF exec(writePC_add)='1' THEN
 					data_write_tmp <= TG68_PC_add;
 -- paste and copy form TH	---------	
-				elsif micro_state=trap00 AND fpu_tf='1' THEN
+				elsif micro_state=trap00 AND (fpu_tf='1' OR fpu_tu='1') THEN
 					data_write_tmp <= fpu_ea_out;		-- unimplemented FP: the <ea>
 					useStackframe2<='1';
 					writePCnext <= '0';
@@ -1040,7 +1044,10 @@ PROCESS (clk)
 		  -- this is only active for 010+ since in 000 writePC is
 		  -- true in state trap0
 --					if trap_trace='1' or set_exec(opcTRAPV)='1' or Z_error='1' then
-					IF	useStackframe2='1' THEN
+					IF	useStackframe2='1' AND fpu_tu='1' THEN
+						-- FMOVE.P out: format $3, the effective address (68040 UM 9.6.2)
+						data_write_tmp(15 downto 0) <= "0011" & trap_vector(11 downto 0);
+					ELSIF	useStackframe2='1' THEN
 						-- stack frame format #2
 						data_write_tmp(15 downto 0) <= "0010" & trap_vector(11 downto 0); --TH
 					else
@@ -1140,6 +1147,9 @@ PROCESS (clk, setdisp, memaddr_a, briefdata, memaddr_delta, setdispbyte, datatyp
 				END IF;	
 				IF trap_fmt='1' THEN
 					trap_vector(9 downto 0) <= "00" & X"38";		-- format error
+				END IF;
+				IF trap_unsupp='1' THEN
+					trap_vector(9 downto 0) <= "00" & X"DC";		-- FP unsupported data type
 				END IF;
 				IF trap_trap='1' THEN
 					trap_vector(9 downto 0) <= "0010" & opcode(3 downto 0) & "00";
@@ -1755,7 +1765,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		 datatype, interrupt, c_out, trapmake, rot_cnt, brief, addr, trap_trapv, last_data_in, use_VBR_Stackframe,
 		 long_start, set_datatype, sndOPC, set_exec, exec, ea_build_now, reg_QA, reg_QB, make_berr, trap_berr,
 		 cpu040, m16_done, fpu_ins, fpu_gen, fpu_memea, fpu_fbcc, fpu_unimpl, fpu_done, mmu_ptest_done,
-		 fpu_unimp, fpu_trap2, fpu_ftrap)
+		 fpu_unimp, fpu_trap2, fpu_ftrap, fpu_unsupp, fpu_upost, fpu_trap55)
 	BEGIN
 		TG68_PC_brw <= '0';	
 		setstate <= "00";
@@ -1798,6 +1808,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		trap_1010 <='0';
 		trap_1111 <='0';
 		trap_fmt <= '0';
+		trap_unsupp <= '0';
 		trap_trap <='0';
 		trap_trapv <= '0';
 		trapmake <='0';
@@ -1851,7 +1862,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		IF trapmake='1' AND trapd='0' THEN
 			-- exec(trap_chk) still holds a CHK that did not trap during the decode
 			-- cycle of the next instruction: a CHK only traps outside decode
-			IF cpu(1)='1' AND (trap_trapv='1' OR set_Z_error='1' OR (exec(trap_chk)='1' AND decodeOPC='0') OR fpu_trap2='1') THEN
+			IF cpu(1)='1' AND (trap_trapv='1' OR set_Z_error='1' OR (exec(trap_chk)='1' AND decodeOPC='0') OR fpu_trap2='1' OR (fpu_trap55='1' AND fpu_upost='1')) THEN
 				next_micro_state <= trap00;
 			else
 				next_micro_state <= trap0;
@@ -4303,6 +4314,12 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 						-- $2 (68040 UM 9.6); trapmake chooses trap00 (fpu_trap2)
 						trap_1111 <= '1';
 						trapmake <= '1';
+					ELSIF fpu_done='1' AND fpu_unsupp='1' THEN
+						-- unsupported data type (packed decimal): vector 55, format $0
+						-- with the next instruction, or $3 with the effective address
+						-- for FMOVE.P out (68040 UM 9.6.2)
+						trap_unsupp <= '1';
+						trapmake <= '1';
 					ELSIF fpu_done='1' AND fpu_ftrap='1' THEN
 						-- FTRAPcc taken: vector 7, format $2 as TRAPcc
 						trap_trapv <= '1';
@@ -4751,6 +4768,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
   -- FBcc tests its predicate in bra1: a signaling one on a NaN sets BSUN
   fpu_bsun <= '1' WHEN micro_state=bra1 AND cpu040='1' AND exe_opcode(15 downto 7)="111100101" ELSE '0';
   fpu_trap2 <= '1' WHEN micro_state=fpu_wait AND fpu_done='1' AND fpu_unimp='1' ELSE '0';
+  fpu_trap55 <= '1' WHEN micro_state=fpu_wait AND fpu_done='1' AND fpu_unsupp='1' ELSE '0';
   -- marks the exception entry of an unimplemented FP instruction
   process (clk)
   begin
@@ -4758,11 +4776,17 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 	  if Reset = '1' then
 		fpu_tf <= '0';
 		fpu_tfp <= '0';
+		fpu_tu <= '0';
 	  elsif clkena_lw = '1' then
 		if fpu_trap2 = '1' then
 		  fpu_tf <= '1';
 		elsif micro_state = trap3 then
 		  fpu_tf <= '0';
+		end if;
+		if fpu_trap55 = '1' then
+		  fpu_tu <= '1';
+		elsif micro_state = trap3 then
+		  fpu_tu <= '0';
 		end if;
 		if micro_state = fpu_wait and fpu_done = '1' and fpu_ftrap = '1' then
 		  fpu_tfp <= '1';
@@ -4775,7 +4799,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
   fpu_rd_data <= regfile(fpu_rd_idx);
 
   -- the command word of a cpGEN instruction is on data_read during its
-  -- decode; packed decimal, FMOVECR and effective addresses the
+  -- decode; FMOVECR and effective addresses the
   -- instruction does not allow take Line-F there
   process (data_read, opcode)
 	variable c : std_logic_vector(15 downto 0);
@@ -4813,13 +4837,11 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 	  when "000" | "010" =>
 		-- operations the 68040 leaves to the FPSP run as far as the operand
 		-- fetch and take vector 11 with a format $2 frame (TG68K_FPU)
-		if c(14) = '1' and (c(12 downto 10) = "011" or c(12 downto 10) = "111") then
+		-- FMOVECR; packed decimal goes to the FPU (vector 55)
+		if c(14) = '1' and c(12 downto 10) = "111" then
 		  fpu_unimpl <= '1';
 		end if;
-	  when "011" =>
-		if c(12 downto 10) = "011" or c(12 downto 10) = "111" then
-		  fpu_unimpl <= '1';
-		end if;
+	  when "011" => null;		-- FMOVE.P out included (vector 55)
 	  when "110" | "111" => null;		-- static or dynamic register lists
 	  when "100" | "101" => null;
 	  when others => fpu_unimpl <= '1';
@@ -4902,7 +4924,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
   fpu : entity work.TG68K_FPU
 	port map (clk => clk, reset => Reset, clkena => clkena_lw, start => fpu_start,
 			  opcode => opcode, cmd => sndOPC, ea => fpu_ea, iaddr => exe_pc, done => fpu_done,
-			  unimp => fpu_unimp, ea_out => fpu_ea_out, ftrap => fpu_ftrap, br_take => fpu_br,
+			  unimp => fpu_unimp, unsupp => fpu_unsupp, upost => fpu_upost, ea_out => fpu_ea_out, ftrap => fpu_ftrap, br_take => fpu_br,
 			  br_target => fpu_br_target,
 			  rd_idx => fpu_rd_idx, rd_data => fpu_rd_data, wr_en => fpu_wr_en, wr_idx => fpu_wr_idx,
 			  wr_data => fpu_wr_data, wr_size => fpu_wr_size, bus_act => fpu_bus_act,

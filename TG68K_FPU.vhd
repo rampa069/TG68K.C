@@ -24,11 +24,19 @@
 -- floating-point instruction exception (vector 11, format $2); the FSAVE
 -- of the FPSP then gets the 26-word unimplemented instruction frame with
 -- the command word, the source (ETEMP), the destination register (FPTEMP)
--- and their tags. FMOVECR and packed decimal are recognized by the kernel,
--- which takes Line-F with a format $0 frame (the FPSP emulates FMOVECR from
--- that). Immediate data is read like a
--- memory operand at the address the kernel gives. FPCR exception enables
--- are kept but never trap.
+-- and their tags. FMOVECR is recognized by the kernel, which takes Line-F
+-- with a format $0 frame (the FPSP emulates FMOVECR from that). Packed
+-- decimal is an unsupported data type, as on the 68040 (UM 9.6.2): a packed
+-- source is read as it is (bits 95-64 to FPTEMP, 63-0 to ETEMP) and
+-- unsupp is set with done, and the kernel takes vector 55 with a format $0
+-- frame; FMOVE.P FPn,<ea> writes nothing, sets unsupp and post, and the
+-- kernel takes vector 55 with a format $3 frame (the effective address).
+-- The FSAVE of the FPSP then gets the 50-word busy frame, and an FRESTORE
+-- of a busy frame that the FPSP has left with CU_SAVEPC = $FE and E1 and
+-- E3 clear runs the command word on ETEMP and FPTEMP, as the 68040
+-- completes the instruction (res_func of the FPSP). Immediate data is read
+-- like a memory operand at the address the kernel gives. FPCR exception
+-- enables are kept but never trap.
 --
 -- Copyright (c) 2026 Ramon Martinez. LGPL-3.0-or-later, as TG68K.C.
 ------------------------------------------------------------------------------
@@ -50,6 +58,8 @@ entity TG68K_FPU is
 		iaddr     : in  std_logic_vector(31 downto 0);	-- address of the instruction (FPIAR)
 		done      : out std_logic;
 		unimp     : out std_logic;					-- with done: unimplemented, take vector 11
+		unsupp    : out std_logic;					-- with done: unsupported data type, vector 55
+		upost     : out std_logic;					-- with unsupp: post-instruction (format $3)
 		ea_out    : out std_logic_vector(31 downto 0);	-- the operand address, for that frame
 		ftrap     : out std_logic;					-- with done: FTRAPcc traps
 		br_take   : out std_logic;					-- with done: FDBcc branches
@@ -79,7 +89,7 @@ end entity;
 architecture rtl of TG68K_FPU is
 	type fpregs_t is array (0 to 7) of std_logic_vector(79 downto 0);
 	type bytes_t is array (0 to 11) of std_logic_vector(7 downto 0);
-	type frame_t is array (0 to 51) of std_logic_vector(7 downto 0);
+	type frame_t is array (0 to 99) of std_logic_vector(7 downto 0);
 	constant FP_NAN : std_logic_vector(79 downto 0) := x"7FFF" & x"FFFFFFFFFFFFFFFF";
 
 	signal fpr : fpregs_t := (others => FP_NAN);
@@ -89,7 +99,8 @@ architecture rtl of TG68K_FPU is
 	signal null_state : std_logic := '1';
 
 	type state_t is (IDLE, ST_REG, ST_EA, ST_SRC, ST_XFER, ST_XFER_DONE, ST_ALU, ST_ALU_WAIT,
-					 ST_STORE, ST_CTRL, ST_MOVEM, ST_MOVEM_W, ST_RESTORE, ST_DBCC, ST_UNIMP, ST_LIST, ST_FINISH);
+					 ST_STORE, ST_CTRL, ST_MOVEM, ST_MOVEM_W, ST_RESTORE, ST_RESTORE_B, ST_DBCC, ST_UNIMP,
+					 ST_UNSUPP, ST_LIST, ST_FINISH);
 	signal state : state_t := IDLE;
 	signal ret_state : state_t;
 
@@ -105,7 +116,8 @@ architecture rtl of TG68K_FPU is
 	-- bus sequencer: transfer xn bytes between buf and memory at xa
 	signal buf : bytes_t;
 	signal xa : unsigned(31 downto 0);
-	signal xi, xn : integer range 0 to 52;
+	signal xi, xn : integer range 0 to 100;
+	signal xrframe : std_logic := '0';		-- FRESTORE: reading the fields of a busy frame
 	signal xframe : std_logic := '0';		-- FSAVE: the data comes from the unimp frame
 	signal xwr : std_logic;
 	signal xbyte : std_logic;			-- the current cycle moves one byte
@@ -132,6 +144,15 @@ architecture rtl of TG68K_FPU is
 	signal uop : std_logic;
 	signal etemp, fptemp : std_logic_vector(79 downto 0);
 	signal cmd1b : std_logic_vector(15 downto 0);
+	-- the unsupported data type, for the busy frame
+	signal busy_pend : std_logic := '0';
+	signal unsupp_r, upost_r : std_logic := '0';
+	signal pk : std_logic;				-- the source is packed decimal
+	signal fe1, ft : std_logic;			-- E1 and T of the frame
+	signal stag, dtag : std_logic_vector(7 downto 0);
+	-- what an FRESTORE of a busy frame brings back
+	signal cusave : std_logic_vector(7 downto 0);
+	signal re1, re3 : std_logic;
 	signal ufr : frame_t;
 	signal br_r, ftrap_r : std_logic := '0';
 	signal brt : unsigned(31 downto 0);
@@ -276,6 +297,25 @@ architecture rtl of TG68K_FPU is
 		return x"00";
 	end function;
 
+	-- the arithmetic unit operation of a command word, bit 4 set when the
+	-- unit has it (FSQRT also as $05, its CMDREG1B form, UM 9.8)
+	function op_of(opm : std_logic_vector(6 downto 0)) return std_logic_vector is
+	begin
+		case opm is
+			when "0000000" | "1000000" | "1000100" => return "10000";	-- FMOVE
+			when "0011000" | "1011000" | "1011100" => return "10001";	-- FABS
+			when "0011010" | "1011010" | "1011110" => return "10010";	-- FNEG
+			when "0000100" | "0000101" | "1000001" | "1000101" => return "10011";	-- FSQRT
+			when "0100010" | "1100010" | "1100110" => return "10100";	-- FADD
+			when "0101000" | "1101000" | "1101100" => return "10101";	-- FSUB
+			when "0100011" | "1100011" | "1100111" => return "10110";	-- FMUL
+			when "0100000" | "1100000" | "1100100" => return "10111";	-- FDIV
+			when "0111000" => return "11000";							-- FCMP
+			when "0111010" => return "11001";							-- FTST
+			when others => return "00000";
+		end case;
+	end function;
+
 	function buf_long(b : bytes_t; i : integer) return std_logic_vector is
 	begin
 		return b(i) & b(i + 1) & b(i + 2) & b(i + 3);
@@ -283,25 +323,40 @@ architecture rtl of TG68K_FPU is
 begin
 	done <= done_r;
 	unimp <= unimp_r;
+	unsupp <= unsupp_r;
+	upost <= upost_r;
 	ea_out <= std_logic_vector(addr);
 
-	-- the 26-word unimplemented instruction frame (68040 UM figure 9-10;
-	-- offsets from fpsp.h): version $41, size $30
-	process (etemp, fptemp, cmd1b)
+	-- the 26-word unimplemented instruction frame and the 50-word busy
+	-- frame (68040 UM figure 9-10). The FPSP addresses the fields from the
+	-- end of the frame (fpsp.h), so the busy frame has each 48 bytes further
+	-- on: version $41, size $30 or $60, STAG, CMDREG1B, DTAG, the E1 and T
+	-- bytes, FPTEMP and ETEMP; the rest is zero (CU_SAVEPC among them).
+	process (etemp, fptemp, cmd1b, stag, dtag, fe1, ft, busy_pend, fpiar)
 		variable f : frame_t;
+		variable o : integer range 0 to 48;
 	begin
 		f := (others => x"00");
-		f(0) := x"41"; f(1) := x"30";
-		f(12) := tag_of(etemp);					-- STAG
-		f(16) := cmd1b(15 downto 8); f(17) := cmd1b(7 downto 0);	-- CMDREG1B
-		f(20) := tag_of(fptemp);				-- DTAG
-		f(28) := fptemp(79 downto 72); f(29) := fptemp(71 downto 64);
+		f(0) := x"41";
+		if busy_pend = '1' then
+			f(1) := x"60"; o := 48;
+			f(40) := fpiar(31 downto 24); f(41) := fpiar(23 downto 16);	-- FPIARCU
+			f(42) := fpiar(15 downto 8); f(43) := fpiar(7 downto 0);
+		else
+			f(1) := x"30"; o := 0;
+		end if;
+		f(o + 12) := stag;						-- STAG
+		f(o + 16) := cmd1b(15 downto 8); f(o + 17) := cmd1b(7 downto 0);	-- CMDREG1B
+		f(o + 20) := dtag;						-- DTAG
+		f(o + 24) := "00000" & fe1 & "00";		-- E1
+		f(o + 25) := "000" & ft & "0000";		-- T
+		f(o + 28) := fptemp(79 downto 72); f(o + 29) := fptemp(71 downto 64);
 		for i in 0 to 7 loop
-			f(32 + i) := fptemp(63 - 8 * i downto 56 - 8 * i);
+			f(o + 32 + i) := fptemp(63 - 8 * i downto 56 - 8 * i);
 		end loop;
-		f(40) := etemp(79 downto 72); f(41) := etemp(71 downto 64);
+		f(o + 40) := etemp(79 downto 72); f(o + 41) := etemp(71 downto 64);
 		for i in 0 to 7 loop
-			f(44 + i) := etemp(63 - 8 * i downto 56 - 8 * i);
+			f(o + 44 + i) := etemp(63 - 8 * i downto 56 - 8 * i);
 		end loop;
 		ufr <= f;
 	end process;
@@ -325,7 +380,7 @@ begin
 	bus_lds_n <= '1' when xbyte = '1' and xa(0) = '0' else '0';
 	process (xframe, xbyte, xi, ufr, buf)
 	begin
-		if xframe = '1' and xi < 51 then
+		if xframe = '1' and xi < 99 then
 			bus_wdata <= ufr(xi) & ufr(xi + 1);
 		elsif xi > 11 then
 			bus_wdata <= (others => '0');		-- not a transfer of buf
@@ -363,10 +418,13 @@ begin
 				fpiar <= (others => '0');
 				null_state <= '1';
 				unimp_pend <= '0';
+				busy_pend <= '0';
 				xframe <= '0';
+				xrframe <= '0';
 			elsif clkena = '1' then
 				done_r <= '0';
 				unimp_r <= '0';
+				unsupp_r <= '0';
 				alu_start <= '0';
 				wr_en <= '0';
 				if pred_bsun = '1' and pred(4) = '1' and fpsr(24) = '1' then
@@ -387,6 +445,8 @@ begin
 						wr_fp <= '0';
 						set_cc <= '0';
 						store <= '0';
+						pk <= '0';
+						upost_r <= '0';
 						state <= ST_REG;
 					end if;
 
@@ -394,7 +454,9 @@ begin
 				when ST_REG =>
 					areg <= rd_data;
 					-- operand size in memory
-					if opc(8 downto 6) = "100" and unimp_pend = '1' then
+					if opc(8 downto 6) = "100" and busy_pend = '1' then
+						nb := 100;								-- FSAVE, busy frame
+					elsif opc(8 downto 6) = "100" and unimp_pend = '1' then
 						nb := 52;								-- FSAVE, unimplemented frame
 					elsif opc(8 downto 6) = "100" or opc(8 downto 6) = "101" then
 						nb := 4;								-- FSAVE, FRESTORE header
@@ -406,6 +468,8 @@ begin
 						-- static list (mode bit 11 clear), or one in Dn (ST_LIST)
 						list <= cw(7 downto 0);
 						nb := 12 * popcount8(cw(7 downto 0));
+					elsif cls = "011" and fmt = "111" then
+						nb := 12;								-- FMOVE.P, dynamic k-factor
 					else
 						nb := fmt_bytes(cw(12 downto 10));
 					end if;
@@ -500,10 +564,13 @@ begin
 						null_state <= null_state;
 						buf(1) <= x"00"; buf(2) <= x"00"; buf(3) <= x"00";
 						xa <= addr; xi <= 0; xn <= 4; xwr <= '1';
-						if unimp_pend = '1' then
+						-- the pending frame is cleared once stored (ST_XFER_DONE)
+						if busy_pend = '1' then
+							xn <= 100;
+							xframe <= '1';
+						elsif unimp_pend = '1' then
 							xn <= 52;
 							xframe <= '1';
-							unimp_pend <= '0';
 						end if;
 						state <= ST_XFER; ret_state <= ST_FINISH;
 					elsif opc(8 downto 6) = "101" then
@@ -529,8 +596,11 @@ begin
 						-- fetched and converted all the same (ST_UNIMP)
 						if ok then uop <= '0'; else uop <= '1'; end if;
 						ok := true;
-						if cls = "010" and (fmt = "011" or fmt = "111") then
-							ok := false;		-- packed decimal, FMOVECR: the kernel took Line-F
+						if cls = "010" and fmt = "111" then
+							ok := false;		-- FMOVECR: the kernel took Line-F
+						end if;
+						if cls = "010" and fmt = "011" then
+							pk <= '1';			-- packed decimal: an unsupported data type
 						end if;
 						if not ok then
 							done_r <= '1'; state <= ST_FINISH;
@@ -587,6 +657,18 @@ begin
 							when "110" => alu_op <= x"A"; alu_rp <= "00"; state <= ST_ALU;
 							when "001" => alu_op <= x"0"; alu_rp <= "01"; state <= ST_ALU;
 							when "101" => alu_op <= x"0"; alu_rp <= "10"; state <= ST_ALU;
+							when "011" | "111" =>
+								-- packed decimal: the post-instruction unsupported data
+								-- type exception, the FPSP converts and stores it
+								etemp <= fpr(fpn);
+								stag <= tag_of(fpr(fpn));
+								dtag <= x"00";
+								fptemp <= (others => '0');
+								cmd1b <= cw;
+								fe1 <= '1'; ft <= '1';
+								busy_pend <= '1'; unimp_pend <= '0';
+								unsupp_r <= '1'; upost_r <= '1';
+								done_r <= '1'; state <= ST_FINISH;
 							when "010" =>
 								-- extended: a copy, no rounding
 								x := fpr(fpn);
@@ -662,7 +744,25 @@ begin
 				-- one bus cycle a clock: a word, or a byte for an odd address or
 				-- the last byte
 				when ST_XFER =>
-					if xwr = '0' and xi < 12 then
+					if xrframe = '1' then
+						-- FRESTORE of a busy frame: the fields it needs
+						case xi is
+							when 8 => cusave <= data_in(15 downto 8);
+							when 64 => cmd1b <= data_in;
+							when 72 => re1 <= data_in(10); re3 <= data_in(9);
+							when 76 => fptemp(79 downto 64) <= data_in;
+							when 80 => fptemp(63 downto 48) <= data_in;
+							when 82 => fptemp(47 downto 32) <= data_in;
+							when 84 => fptemp(31 downto 16) <= data_in;
+							when 86 => fptemp(15 downto 0) <= data_in;
+							when 88 => etemp(79 downto 64) <= data_in;
+							when 92 => etemp(63 downto 48) <= data_in;
+							when 94 => etemp(47 downto 32) <= data_in;
+							when 96 => etemp(31 downto 16) <= data_in;
+							when 98 => etemp(15 downto 0) <= data_in;
+							when others => null;
+						end case;
+					elsif xwr = '0' and xi < 12 then
 						if xbyte = '1' then
 							if xa(0) = '1' then buf(xi) <= data_in(7 downto 0);
 							else buf(xi) <= data_in(15 downto 8); end if;
@@ -680,6 +780,11 @@ begin
 					end if;
 				when ST_XFER_DONE =>
 					xframe <= '0';
+					xrframe <= '0';
+					if xframe = '1' then
+						busy_pend <= '0';
+						unimp_pend <= '0';
+					end if;
 					state <= ret_state;
 					if (ret_state = ST_ALU or ret_state = ST_UNIMP) and store = '0' then
 						-- convert the memory or immediate source
@@ -699,17 +804,52 @@ begin
 				when ST_ALU =>
 					if uop = '1' then
 						state <= ST_UNIMP;
+					elsif pk = '1' then
+						state <= ST_UNSUPP;
 					else
 						alu_start <= '1';
 						state <= ST_ALU_WAIT;
 					end if;
 				when ST_UNIMP =>
 					-- keep what the FPSP needs and report the exception
-					etemp <= alu_src;
-					fptemp <= fpr(to_integer(unsigned(cw(9 downto 7))));
+					x := fpr(to_integer(unsigned(cw(9 downto 7))));
+					dtag <= tag_of(x);
 					cmd1b <= cw;
+					ft <= '0';
+					if pk = '1' then
+						-- a packed source: E1 set, bits 95-64 in FPTEMP, 63-0 in ETEMP
+						etemp <= x"0000" & buf_long(buf, 4) & buf_long(buf, 8);
+						fptemp <= x"000000000000" & buf_long(buf, 0);
+						stag <= x"00";
+						fe1 <= '1';
+					else
+						etemp <= alu_src;
+						fptemp <= x;
+						stag <= tag_of(alu_src);
+						fe1 <= '0';
+					end if;
 					unimp_pend <= '1';
+					busy_pend <= '0';
 					unimp_r <= '1';
+					done_r <= '1';
+					state <= ST_FINISH;
+				when ST_UNSUPP =>
+					-- packed decimal source of an operation the unit has: the
+					-- pre-instruction unsupported data type exception (UM 9.6.2,
+					-- table 9-16); FSQRT goes in CMDREG1B as $05 (UM 9.8)
+					x := fpr(to_integer(unsigned(cw(9 downto 7))));
+					dtag <= tag_of(x);
+					stag <= x"00";
+					etemp <= x"0000" & buf_long(buf, 4) & buf_long(buf, 8);
+					fptemp <= x"000000000000" & buf_long(buf, 0);
+					if cw(6 downto 0) = "0000100" then
+						cmd1b <= cw(15 downto 7) & "0000101";
+					else
+						cmd1b <= cw;
+					end if;
+					fe1 <= '1'; ft <= '0';
+					busy_pend <= '1'; unimp_pend <= '0';
+					unsupp_r <= '1';
 					done_r <= '1';
 					state <= ST_FINISH;
 				when ST_ALU_WAIT =>
@@ -836,24 +976,62 @@ begin
 					state <= ST_FINISH;
 
 				when ST_RESTORE =>
-					-- FRESTORE: a null frame resets the FPU; other frames are skipped
+					-- FRESTORE: a null frame resets the FPU; a busy frame is read
+					-- (ST_RESTORE_B); other frames are skipped
 					if mode = "011" and buf(1) /= x"00" then
 						-- (An)+ skips the rest of a longer frame
 						wr_en <= '1'; wr_idx <= 8 + to_integer(unsigned(reg)); wr_size <= "10";
 						wr_data <= std_logic_vector(unsigned(areg) + 4 + unsigned(buf(1)));
 					end if;
 					unimp_pend <= '0';
+					busy_pend <= '0';
 					if buf(0) = x"00" then
 						fpr <= (others => FP_NAN);
 						fpcr <= (others => '0');
 						fpsr <= (others => '0');
 						fpiar <= (others => '0');
 						null_state <= '1';
+						done_r <= '1';
+						state <= ST_FINISH;
+					elsif buf(1) = x"60" then
+						null_state <= '0';
+						xa <= addr + 4; xi <= 4; xn <= 100; xwr <= '0';
+						xrframe <= '1';
+						state <= ST_XFER; ret_state <= ST_RESTORE_B;
 					else
 						null_state <= '0';
+						done_r <= '1';
+						state <= ST_FINISH;
 					end if;
-					done_r <= '1';
-					state <= ST_FINISH;
+				when ST_RESTORE_B =>
+					-- a busy frame the FPSP left for the 68040 to complete (res_func:
+					-- CU_SAVEPC $FE, E1 clear): run the command word on ETEMP and
+					-- FPTEMP, the result to its FPn
+					opm := cmd1b(6 downto 0);
+					e := '0' & op_of(opm);
+					if cusave = x"FE" and re1 = '0' and re3 = '0' and e(4) = '1' then
+						alu_op <= e(3 downto 0);
+						cw <= cmd1b;
+						if opm(6) = '1' then
+							if opm(2) = '1' then alu_rp <= "10"; else alu_rp <= "01"; end if;
+						else
+							alu_rp <= fpcr(7 downto 6);
+						end if;
+						alu_rm <= fpcr(5 downto 4);
+						alu_tomem <= '0';
+						alu_src <= etemp;
+						alu_dst <= fptemp;
+						if opm /= "0111000" and opm /= "0111010" then
+							wr_fp <= '1';
+						end if;
+						set_cc <= '1';
+						uop <= '0';
+						pk <= '0';
+						state <= ST_ALU;
+					else
+						done_r <= '1';
+						state <= ST_FINISH;
+					end if;
 
 				when ST_FINISH =>
 					state <= IDLE;
