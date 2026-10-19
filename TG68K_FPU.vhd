@@ -15,7 +15,7 @@
 --          opclass 011 FMOVE FPn,<ea> (B W L S D X)
 --          opclass 100/101 FMOVE(M) <ea>,FPcr and FPcr,<ea>
 --          opclass 110/111 FMOVEM <ea>,list and list,<ea>
---   FScc, FDBcc
+--   FScc, FDBcc, FTRAPcc
 --   FSAVE (null or idle frame), FRESTORE
 -- The operations the 68040 leaves to the M68040FPSP (the transcendental
 -- functions, FINT, FINTRZ, FGETEXP, FGETMAN, FMOD, FREM, FSCALE, FSGL*) are
@@ -51,6 +51,7 @@ entity TG68K_FPU is
 		done      : out std_logic;
 		unimp     : out std_logic;					-- with done: unimplemented, take vector 11
 		ea_out    : out std_logic_vector(31 downto 0);	-- the operand address, for that frame
+		ftrap     : out std_logic;					-- with done: FTRAPcc traps
 		br_take   : out std_logic;					-- with done: FDBcc branches
 		br_target : out std_logic_vector(31 downto 0);
 		-- integer register file
@@ -131,7 +132,7 @@ architecture rtl of TG68K_FPU is
 	signal etemp, fptemp : std_logic_vector(79 downto 0);
 	signal cmd1b : std_logic_vector(15 downto 0);
 	signal ufr : frame_t;
-	signal br_r : std_logic := '0';
+	signal br_r, ftrap_r : std_logic := '0';
 	signal brt : unsigned(31 downto 0);
 
 	-- memory formats to extended (an unnormal extended value is fine: the
@@ -304,6 +305,7 @@ begin
 		ufr <= f;
 	end process;
 	br_take <= br_r;
+	ftrap <= ftrap_r;
 	br_target <= std_logic_vector(brt);
 
 	alu : entity work.TG68K_FPU_ALU
@@ -369,6 +371,7 @@ begin
 				case state is
 				when IDLE =>
 					br_r <= '0';
+					ftrap_r <= '0';
 					if start = '1' then
 						opc <= opcode;
 						cw <= cmd;
@@ -391,7 +394,7 @@ begin
 					elsif opc(8 downto 6) = "100" or opc(8 downto 6) = "101" then
 						nb := 4;								-- FSAVE, FRESTORE header
 					elsif opc(8 downto 6) = "001" then
-						nb := 1;								-- FScc byte (FDBcc: none)
+						nb := 1;								-- FScc byte (FDBcc, FTRAPcc: none)
 					elsif cls = "100" or cls = "101" then
 						nb := 4 * popcount3(cw(12 downto 10));	-- control registers
 					elsif cls = "110" or cls = "111" then
@@ -450,7 +453,11 @@ begin
 						else
 							buf(0) <= x"00";
 						end if;
-						if mode = "001" then
+						if mode = "111" and reg(2 downto 1) /= "00" then
+							-- FTRAPcc: the kernel takes vector 7 when the predicate is true
+							ftrap_r <= pred_eval(cw(5 downto 0), fpsr(27), fpsr(26), fpsr(24));
+							done_r <= '1'; state <= ST_FINISH;
+						elsif mode = "001" then
 							-- FDBcc: when false, Dn.w - 1, and branch unless it is -1
 							if pred_eval(cw(5 downto 0), fpsr(27), fpsr(26), fpsr(24)) = '1' then
 								done_r <= '1'; state <= ST_FINISH;

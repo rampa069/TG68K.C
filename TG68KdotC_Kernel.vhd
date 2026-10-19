@@ -407,6 +407,7 @@ architecture logic of TG68KdotC_Kernel is
 	signal fpu_start, fpu_done, fpu_jump : std_logic;
 	signal fpu_br : std_logic;
 	signal fpu_unimp, fpu_trap2, fpu_tf : std_logic := '0';
+	signal fpu_ftrap, fpu_ftrapcc, fpu_tfp : std_logic := '0';
 	signal fpu_ea_out : std_logic_vector(31 downto 0);
 	signal fpu_br_target, fpu_target : std_logic_vector(31 downto 0);
 	signal fpu_ea_r, fpu_ea, fpu_next_pc : std_logic_vector(31 downto 0);
@@ -931,8 +932,8 @@ PROCESS (clk)
 				
 				IF writePC='1' THEN
 					data_write_tmp <= TG68_PC;
-				ELSIF fpu_tf='1' AND micro_state=trap1 THEN
-					data_write_tmp <= fpu_next_pc;		-- unimplemented FP: the next instruction
+				ELSIF (fpu_tf='1' OR fpu_tfp='1') AND micro_state=trap1 THEN
+					data_write_tmp <= fpu_next_pc;		-- unimplemented FP, FTRAPcc: the next instruction
 				ELSIF exec(writePC_add)='1' THEN
 					data_write_tmp <= TG68_PC_add;
 -- paste and copy form TH	---------	
@@ -1607,7 +1608,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		 datatype, interrupt, c_out, trapmake, rot_cnt, brief, addr, trap_trapv, last_data_in, use_VBR_Stackframe,
 		 long_start, set_datatype, sndOPC, set_exec, exec, ea_build_now, reg_QA, reg_QB, make_berr, trap_berr,
 		 cpu040, m16_done, fpu_ins, fpu_gen, fpu_memea, fpu_fbcc, fpu_unimpl, fpu_done, mmu_ptest_done,
-		 fpu_unimp, fpu_trap2)
+		 fpu_unimp, fpu_trap2, fpu_ftrap)
 	BEGIN
 		TG68_PC_brw <= '0';	
 		setstate <= "00";
@@ -3302,7 +3303,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 							END IF;
 						END IF;
 					ELSIF fpu_ins='0' THEN
-						-- FScc, FDBcc, FTRAPcc and the rest: not yet
+						-- FSAVE/FRESTORE-like encodings that are not instructions
 						trap_1111 <= '1';
 						trapmake <= '1';
 					ELSIF opcode(8)='1' AND SVmode='0' THEN
@@ -4121,6 +4122,10 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 						-- $2 (68040 UM 9.6); trapmake chooses trap00 (fpu_trap2)
 						trap_1111 <= '1';
 						trapmake <= '1';
+					ELSIF fpu_done='1' AND fpu_ftrap='1' THEN
+						-- FTRAPcc taken: vector 7, format $2 as TRAPcc
+						trap_trapv <= '1';
+						trapmake <= '1';
 					ELSIF fpu_done='1' THEN
 						next_micro_state <= fpu_end;
 					ELSE
@@ -4314,15 +4319,16 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 -- 68040 FPU
 -----------------------------------------------------------------------------
   fpu_fbcc <= '1' WHEN cpu040='1' AND opcode(15 downto 7)="111100101" ELSE '0';
-  -- cpGEN and FScc/FDBcc have a command word or condition word after the opcode
+  -- cpGEN and FScc/FDBcc/FTRAPcc have a command or condition word after the opcode
   fpu_gen <= '1' WHEN cpu040='1' AND opcode(15 downto 7)="111100100" AND
-                      NOT (opcode(6)='1' AND opcode(5 downto 3)="111" AND opcode(2 downto 1)/="00") ELSE '0';
-  -- FTRAPcc (F27A-F27C) is not among them yet
+                      NOT (opcode(6)='1' AND opcode(5 downto 3)="111" AND opcode(2 downto 0)>"100") ELSE '0';
+  fpu_ftrapcc <= '1' WHEN opcode(8 downto 6)="001" AND opcode(5 downto 3)="111" AND
+                          opcode(2 downto 1)/="00" ELSE '0';
   fpu_ins <= '1' WHEN fpu_gen='1' OR (cpu040='1' AND opcode(15 downto 7)="111100110" AND opcode(6)='0') OR
                       (cpu040='1' AND opcode(15 downto 6)="1111001101") ELSE '0';
   -- (d16,An), (d8,An,Xn), absolute and PC-relative modes
-  fpu_memea <= '1' WHEN opcode(5 downto 3)="101" OR opcode(5 downto 3)="110" OR
-                        (opcode(5 downto 3)="111" AND opcode(2)='0') ELSE '0';
+  fpu_memea <= '1' WHEN (opcode(5 downto 3)="101" OR opcode(5 downto 3)="110" OR
+                         (opcode(5 downto 3)="111" AND opcode(2)='0')) AND fpu_ftrapcc='0' ELSE '0';
   fpu_pred <= exe_opcode(5 downto 0);
   fpu_start <= '1' WHEN micro_state=fpu_go ELSE '0';
   fpu_jump <= '1' WHEN micro_state=fpu_end ELSE '0';
@@ -4333,11 +4339,17 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 	if rising_edge(clk) then
 	  if Reset = '1' then
 		fpu_tf <= '0';
+		fpu_tfp <= '0';
 	  elsif clkena_lw = '1' then
 		if fpu_trap2 = '1' then
 		  fpu_tf <= '1';
 		elsif micro_state = trap3 then
 		  fpu_tf <= '0';
+		end if;
+		if micro_state = fpu_wait and fpu_done = '1' and fpu_ftrap = '1' then
+		  fpu_tfp <= '1';
+		elsif micro_state = trap3 then
+		  fpu_tfp <= '0';
 		end if;
 	  end if;
 	end if;
@@ -4415,48 +4427,54 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 
   -- bytes after the opcode (and command word): extension words of the
   -- effective address, or the immediate data
-  process (opcode, sndOPC, brief)
+  process (opcode, sndOPC, brief, fpu_ftrapcc)
 	variable n : integer range 0 to 16;
+	variable full : integer range 0 to 16;
   begin
+	-- (d8,An,Xn) and (d8,PC,Xn): the brief or full extension word, with
+	-- the base and outer displacements of the full format
+	full := 2;
+	if brief(8) = '1' then
+	  if brief(5 downto 4) = "10" then full := full + 2; elsif brief(5 downto 4) = "11" then full := full + 4; end if;
+	  if brief(1 downto 0) = "10" then full := full + 2; elsif brief(1 downto 0) = "11" then full := full + 4; end if;
+	end if;
 	n := 0;
-	case opcode(5 downto 3) is
-	  when "001" =>
-		if opcode(8 downto 6) = "001" then n := 2; end if;		-- FDBcc displacement
-	  when "101" => n := 2;
-	  when "110" =>
-		n := 2;
-		if brief(8) = '1' then
-		  if brief(5 downto 4) = "10" then n := n + 2; elsif brief(5 downto 4) = "11" then n := n + 4; end if;
-		  if brief(1 downto 0) = "10" then n := n + 2; elsif brief(1 downto 0) = "11" then n := n + 4; end if;
-		end if;
-	  when "111" =>
-		case opcode(2 downto 0) is
-		  when "000" | "010" => n := 2;
-		  when "001" => n := 4;
-		  when "011" =>
-			n := 2;
-			if brief(8) = '1' then
-			  if brief(5 downto 4) = "10" then n := n + 2; elsif brief(5 downto 4) = "11" then n := n + 4; end if;
-			  if brief(1 downto 0) = "10" then n := n + 2; elsif brief(1 downto 0) = "11" then n := n + 4; end if;
-			end if;
-		  when "100" =>
-			if sndOPC(15 downto 13) = "100" then
-			  n := 0;
-			  if sndOPC(12) = '1' then n := n + 4; end if;
-			  if sndOPC(11) = '1' then n := n + 4; end if;
-			  if sndOPC(10) = '1' then n := n + 4; end if;
-			else
-			  case sndOPC(12 downto 10) is
-				when "000" | "001" => n := 4;
-				when "010" | "011" => n := 12;
-				when "101" => n := 8;
-				when others => n := 2;
-			  end case;
-			end if;
-		  when others => n := 0;
-		end case;
-	  when others => n := 0;
-	end case;
+	if fpu_ftrapcc = '1' then
+	  -- FTRAPcc.W, .L or no operand
+	  case opcode(2 downto 0) is
+		when "010" => n := 2;
+		when "011" => n := 4;
+		when others => n := 0;
+	  end case;
+	else
+	  case opcode(5 downto 3) is
+		when "001" =>
+		  if opcode(8 downto 6) = "001" then n := 2; end if;		-- FDBcc displacement
+		when "101" => n := 2;
+		when "110" => n := full;
+		when "111" =>
+		  case opcode(2 downto 0) is
+			when "000" | "010" => n := 2;
+			when "001" => n := 4;
+			when "011" => n := full;
+			when "100" =>
+			  if sndOPC(15 downto 13) = "100" then
+				if sndOPC(12) = '1' then n := n + 4; end if;
+				if sndOPC(11) = '1' then n := n + 4; end if;
+				if sndOPC(10) = '1' then n := n + 4; end if;
+			  else
+				case sndOPC(12 downto 10) is
+				  when "000" | "001" => n := 4;
+				  when "010" | "011" => n := 12;
+				  when "101" => n := 8;
+				  when others => n := 2;
+				end case;
+			  end if;
+			when others => n := 0;
+		  end case;
+		when others => n := 0;
+	  end case;
+	end if;
 	fpu_ext <= n;
   end process;
   fpu_next_pc <= exe_pc + 2 WHEN opcode(15 downto 8)=X"F5" ELSE			-- PTEST
@@ -4466,7 +4484,8 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
   fpu : entity work.TG68K_FPU
 	port map (clk => clk, reset => Reset, clkena => clkena_lw, start => fpu_start,
 			  opcode => opcode, cmd => sndOPC, ea => fpu_ea, iaddr => exe_pc, done => fpu_done,
-			  unimp => fpu_unimp, ea_out => fpu_ea_out, br_take => fpu_br, br_target => fpu_br_target,
+			  unimp => fpu_unimp, ea_out => fpu_ea_out, ftrap => fpu_ftrap, br_take => fpu_br,
+			  br_target => fpu_br_target,
 			  rd_idx => fpu_rd_idx, rd_data => fpu_rd_data, wr_en => fpu_wr_en, wr_idx => fpu_wr_idx,
 			  wr_data => fpu_wr_data, wr_size => fpu_wr_size, bus_act => fpu_bus_act,
 			  bus_addr => fpu_bus_addr, bus_wr => fpu_bus_wr, bus_uds_n => fpu_uds_n,
