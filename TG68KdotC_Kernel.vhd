@@ -1074,8 +1074,10 @@ PROCESS (clk)
 					-- LINK A7: SP - 4 -> SP; An -> (SP), so the pushed value is the
 					-- decremented SP (M68000 PRM, LINK); the predecrement is being
 					-- written to A7 on this edge
+					-- (that write is A7 - 4: taken from the register, not from regin,
+					-- which would put the ALU on the path to data_write_tmp)
 					IF Wwrena='1' AND RDindex_A=15 THEN
-						data_write_tmp <= regin;
+						data_write_tmp <= regfile(15) - 4;
 					ELSE
 						data_write_tmp <= regfile(15);
 					END IF;
