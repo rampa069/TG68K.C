@@ -406,6 +406,8 @@ architecture logic of TG68KdotC_Kernel is
 	signal fpu_unimpl			: std_logic;	-- the command word of an unimplemented one
 	signal fpu_start, fpu_done, fpu_jump : std_logic;
 	signal fpu_br : std_logic;
+	signal fpu_unimp, fpu_trap2, fpu_tf : std_logic := '0';
+	signal fpu_ea_out : std_logic_vector(31 downto 0);
 	signal fpu_br_target, fpu_target : std_logic_vector(31 downto 0);
 	signal fpu_ea_r, fpu_ea, fpu_next_pc : std_logic_vector(31 downto 0);
 	signal fpu_ext				: integer range 0 to 16;	-- bytes of EA extension and immediate data
@@ -929,9 +931,15 @@ PROCESS (clk)
 				
 				IF writePC='1' THEN
 					data_write_tmp <= TG68_PC;
+				ELSIF fpu_tf='1' AND micro_state=trap1 THEN
+					data_write_tmp <= fpu_next_pc;		-- unimplemented FP: the next instruction
 				ELSIF exec(writePC_add)='1' THEN
 					data_write_tmp <= TG68_PC_add;
 -- paste and copy form TH	---------	
+				elsif micro_state=trap00 AND fpu_tf='1' THEN
+					data_write_tmp <= fpu_ea_out;		-- unimplemented FP: the <ea>
+					useStackframe2<='1';
+					writePCnext <= '0';
 				elsif micro_state=trap00 THEN
 					data_write_tmp <= exe_pc; --TH
 					useStackframe2<='1';
@@ -1598,7 +1606,8 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		 SVmode, preSVmode, stop, long_done, ea_only, setstate, addrvalue, execOPC, exec_write_back, exe_datatype,
 		 datatype, interrupt, c_out, trapmake, rot_cnt, brief, addr, trap_trapv, last_data_in, use_VBR_Stackframe,
 		 long_start, set_datatype, sndOPC, set_exec, exec, ea_build_now, reg_QA, reg_QB, make_berr, trap_berr,
-		 cpu040, m16_done, fpu_ins, fpu_gen, fpu_memea, fpu_fbcc, fpu_unimpl, fpu_done, mmu_ptest_done)
+		 cpu040, m16_done, fpu_ins, fpu_gen, fpu_memea, fpu_fbcc, fpu_unimpl, fpu_done, mmu_ptest_done,
+		 fpu_unimp, fpu_trap2)
 	BEGIN
 		TG68_PC_brw <= '0';	
 		setstate <= "00";
@@ -1693,7 +1702,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		IF trapmake='1' AND trapd='0' THEN
 			-- exec(trap_chk) still holds a CHK that did not trap during the decode
 			-- cycle of the next instruction: a CHK only traps outside decode
-			IF cpu(1)='1' AND (trap_trapv='1' OR set_Z_error='1' OR (exec(trap_chk)='1' AND decodeOPC='0')) THEN
+			IF cpu(1)='1' AND (trap_trapv='1' OR set_Z_error='1' OR (exec(trap_chk)='1' AND decodeOPC='0') OR fpu_trap2='1') THEN
 				next_micro_state <= trap00;
 			else
 				next_micro_state <= trap0;
@@ -4107,7 +4116,12 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 					next_micro_state <= fpu_wait;
 				WHEN fpu_wait =>
 					setstate <= "01";
-					IF fpu_done='1' THEN
+					IF fpu_done='1' AND fpu_unimp='1' THEN
+						-- unimplemented floating-point instruction: vector 11, format
+						-- $2 (68040 UM 9.6); trapmake chooses trap00 (fpu_trap2)
+						trap_1111 <= '1';
+						trapmake <= '1';
+					ELSIF fpu_done='1' THEN
 						next_micro_state <= fpu_end;
 					ELSE
 						next_micro_state <= fpu_wait;
@@ -4312,12 +4326,27 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
   fpu_pred <= exe_opcode(5 downto 0);
   fpu_start <= '1' WHEN micro_state=fpu_go ELSE '0';
   fpu_jump <= '1' WHEN micro_state=fpu_end ELSE '0';
+  fpu_trap2 <= '1' WHEN micro_state=fpu_wait AND fpu_done='1' AND fpu_unimp='1' ELSE '0';
+  -- marks the exception entry of an unimplemented FP instruction
+  process (clk)
+  begin
+	if rising_edge(clk) then
+	  if Reset = '1' then
+		fpu_tf <= '0';
+	  elsif clkena_lw = '1' then
+		if fpu_trap2 = '1' then
+		  fpu_tf <= '1';
+		elsif micro_state = trap3 then
+		  fpu_tf <= '0';
+		end if;
+	  end if;
+	end if;
+  end process;
   fpu_rd_data <= regfile(fpu_rd_idx);
 
   -- the command word of a cpGEN instruction is on data_read during its
-  -- decode; what the 68040 does not do in hardware takes Line-F there
-  -- (M68040 User's Manual table 9-10, packed decimal, FMOVECR, dynamic
-  -- FMOVEM lists, which this unit does not do either)
+  -- decode; packed decimal, FMOVECR and effective addresses the
+  -- instruction does not allow take Line-F there
   process (data_read, opcode)
 	variable c : std_logic_vector(15 downto 0);
 	variable m : std_logic_vector(2 downto 0);
@@ -4352,14 +4381,8 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 	end if;
 	case c(15 downto 13) is
 	  when "000" | "010" =>
-		case c(6 downto 0) is
-		  when "0000000" | "1000000" | "1000100" | "0011000" | "1011000" | "1011100" |
-			   "0011010" | "1011010" | "1011110" | "0000100" | "1000001" | "1000101" |
-			   "0100010" | "1100010" | "1100110" | "0101000" | "1101000" | "1101100" |
-			   "0100011" | "1100011" | "1100111" | "0100000" | "1100000" | "1100100" |
-			   "0111000" | "0111010" => null;
-		  when others => fpu_unimpl <= '1';
-		end case;
+		-- operations the 68040 leaves to the FPSP run as far as the operand
+		-- fetch and take vector 11 with a format $2 frame (TG68K_FPU)
 		if c(14) = '1' and (c(12 downto 10) = "011" or c(12 downto 10) = "111") then
 		  fpu_unimpl <= '1';
 		end if;
@@ -4367,11 +4390,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		if c(12 downto 10) = "011" or c(12 downto 10) = "111" then
 		  fpu_unimpl <= '1';
 		end if;
-	  when "110" | "111" =>
-		-- mode bit 11 set: a dynamic register list in Dn
-		if c(11) = '1' then
-		  fpu_unimpl <= '1';
-		end if;
+	  when "110" | "111" => null;		-- static or dynamic register lists
 	  when "100" | "101" => null;
 	  when others => fpu_unimpl <= '1';
 	end case;
@@ -4447,7 +4466,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
   fpu : entity work.TG68K_FPU
 	port map (clk => clk, reset => Reset, clkena => clkena_lw, start => fpu_start,
 			  opcode => opcode, cmd => sndOPC, ea => fpu_ea, iaddr => exe_pc, done => fpu_done,
-			  br_take => fpu_br, br_target => fpu_br_target,
+			  unimp => fpu_unimp, ea_out => fpu_ea_out, br_take => fpu_br, br_target => fpu_br_target,
 			  rd_idx => fpu_rd_idx, rd_data => fpu_rd_data, wr_en => fpu_wr_en, wr_idx => fpu_wr_idx,
 			  wr_data => fpu_wr_data, wr_size => fpu_wr_size, bus_act => fpu_bus_act,
 			  bus_addr => fpu_bus_addr, bus_wr => fpu_bus_wr, bus_uds_n => fpu_uds_n,
