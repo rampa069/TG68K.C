@@ -36,6 +36,7 @@ entity TG68K_FPU_ALU is
 	port (
 		clk     : in  std_logic;
 		reset   : in  std_logic;
+		ena     : in  std_logic := '1';	-- clock enable
 		start   : in  std_logic;
 		op      : in  std_logic_vector(3 downto 0);
 		rmode   : in  std_logic_vector(1 downto 0);
@@ -138,10 +139,11 @@ begin
 		variable nsgn : std_logic;
 	begin
 		if rising_edge(clk) then
-			done_r <= '0';
 			if reset = '1' then
 				state <= IDLE;
-			else
+				done_r <= '0';
+			elsif ena = '1' then
+				done_r <= '0';
 				case state is
 				when IDLE =>
 					if start = '1' then

@@ -382,6 +382,25 @@ architecture logic of TG68KdotC_Kernel is
 	signal m16_inc_x, m16_inc_y : std_logic;
 	signal m16_rx, m16_ry	: integer range 8 to 15;
 	signal addr_out_core	: std_logic_vector(31 downto 0);
+	-- 68040 FPU (TG68K_FPU): the kernel decodes, builds the effective address
+	-- of the modes it shares with the integer unit and waits in fpu_wait
+	signal fpu_ins				: std_logic;	-- cpGEN, FSAVE or FRESTORE of the FPU
+	signal fpu_gen				: std_logic;	-- cpGEN (a command word follows)
+	signal fpu_memea			: std_logic;	-- effective address built by the kernel
+	signal fpu_fbcc				: std_logic;
+	signal fpu_unimpl			: std_logic;	-- the command word of an unimplemented one
+	signal fpu_start, fpu_done, fpu_jump : std_logic;
+	signal fpu_ea_r, fpu_ea, fpu_next_pc : std_logic_vector(31 downto 0);
+	signal fpu_ext				: integer range 0 to 16;	-- bytes of EA extension and immediate data
+	signal fpu_rd_idx, fpu_wr_idx : integer range 0 to 15;
+	signal fpu_rd_data, fpu_wr_data : std_logic_vector(31 downto 0);
+	signal fpu_wr_en			: std_logic;
+	signal fpu_wr_size			: std_logic_vector(1 downto 0);
+	signal fpu_bus_act, fpu_bus_wr, fpu_uds_n, fpu_lds_n : std_logic;
+	signal fpu_bus_addr		: std_logic_vector(31 downto 0);
+	signal fpu_bus_wdata		: std_logic_vector(15 downto 0);
+	signal fpu_pred				: std_logic_vector(5 downto 0);
+	signal fpu_pred_true		: std_logic;
 	signal data_write_core	: std_logic_vector(15 downto 0);
 	
 
@@ -471,20 +490,24 @@ ALU: TG68K_ALU
 	cpu010 <= cpu(0) OR cpu(1);
 	cpu040 <= cpu(1) AND NOT cpu(0);
 
-	nWr <= '0' WHEN m16_active='1' AND m16_step(3)='1' ELSE
+	nWr <= NOT fpu_bus_wr WHEN fpu_bus_act='1' ELSE
+	       '0' WHEN m16_active='1' AND m16_step(3)='1' ELSE
 	       '1' WHEN m16_active='1' ELSE
 	       '0' WHEN state="11" ELSE '1';
-	busstate <= "11" WHEN m16_active='1' AND m16_step(3)='1' ELSE
+	busstate <= "11" WHEN fpu_bus_act='1' AND fpu_bus_wr='1' ELSE
+	            "10" WHEN fpu_bus_act='1' ELSE
+	            "11" WHEN m16_active='1' AND m16_step(3)='1' ELSE
 	            "10" WHEN m16_active='1' ELSE state;
-	addr_out <= m16_addr WHEN m16_active='1' ELSE addr_out_core;
-	data_write <= m16_buf(conv_integer(m16_step(2 downto 0))) WHEN m16_active='1' AND m16_step(3)='1' ELSE data_write_core;
+	addr_out <= fpu_bus_addr WHEN fpu_bus_act='1' ELSE m16_addr WHEN m16_active='1' ELSE addr_out_core;
+	data_write <= fpu_bus_wdata WHEN fpu_bus_act='1' ELSE
+	              m16_buf(conv_integer(m16_step(2 downto 0))) WHEN m16_active='1' AND m16_step(3)='1' ELSE data_write_core;
 	nResetOut <= '0' WHEN exec(opcRESET)='1' ELSE '1';
 	
 	-- does shift for byte access. note active low me
 	-- should produce address error on 68000
 	memmaskmux <= memmask when addr(0) = '1' else memmask(4 downto 0) & '1';
-	nUDS <= '0' WHEN m16_active='1' ELSE memmaskmux(5);
-	nLDS <= '0' WHEN m16_active='1' ELSE memmaskmux(4);
+	nUDS <= fpu_uds_n WHEN fpu_bus_act='1' ELSE '0' WHEN m16_active='1' ELSE memmaskmux(5);
+	nLDS <= fpu_lds_n WHEN fpu_bus_act='1' ELSE '0' WHEN m16_active='1' ELSE memmaskmux(4);
 	clkena_lw <= '1' WHEN clkena_in='1' AND memmaskmux(3)='1' ELSE '0';
 	clr_berr <= '1' WHEN setopcode='1' AND trap_berr='1' ELSE '0';
 	
@@ -591,7 +614,8 @@ PROCESS (long_start, reg_QB, data_write_tmp, exec, data_read, data_write_mux, me
 -----------------------------------------------------------------------------
 -- Registerfile
 -----------------------------------------------------------------------------
-PROCESS (clk, regfile, RDindex_A, RDindex_B, exec, m16_last, m16_inc_x, m16_inc_y, m16_rx, m16_ry)
+PROCESS (clk, regfile, RDindex_A, RDindex_B, exec, m16_last, m16_inc_x, m16_inc_y, m16_rx, m16_ry,
+		 fpu_wr_en, fpu_wr_size, fpu_wr_idx, fpu_wr_data)
 	BEGIN
 		reg_QA <= regfile(RDindex_A);
 		reg_QB <= regfile(RDindex_B);
@@ -603,6 +627,13 @@ PROCESS (clk, regfile, RDindex_A, RDindex_B, exec, m16_last, m16_inc_x, m16_inc_
 				RDindex_B <= conv_integer(rf_source_addr(3 downto 0));
 				IF Wwrena='1' THEN
 					regfile(RDindex_A) <= regin;
+				END IF;
+				IF fpu_wr_en='1' THEN
+					CASE fpu_wr_size IS
+						WHEN "00" => regfile(fpu_wr_idx)(7 downto 0) <= fpu_wr_data(7 downto 0);
+						WHEN "01" => regfile(fpu_wr_idx)(15 downto 0) <= fpu_wr_data(15 downto 0);
+						WHEN OTHERS => regfile(fpu_wr_idx) <= fpu_wr_data;
+					END CASE;
 				END IF;
 				IF m16_last='1' THEN
 					IF m16_inc_x='1' THEN
@@ -997,6 +1028,8 @@ PROCESS (clk, setdisp, memaddr_a, briefdata, memaddr_delta, setdispbyte, datatyp
 					memaddr_delta_rega <= tmp_TG68_PC;
 				ELSIF exec(direct_delta)='1' THEN
 					memaddr_delta_rega <= data_read;
+				ELSIF fpu_jump='1' THEN
+					memaddr_delta_rega <= fpu_next_pc;
 				ELSIF exec(ea_to_pc)='1' AND setstate="00" THEN
 					memaddr_delta_rega <= addr;
 				ELSIF set(addrlong)='1' THEN
@@ -1133,6 +1166,8 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 --					END IF;
 					IF exec(directPC)='1' THEN
 						TG68_PC <= data_read;
+					ELSIF fpu_jump='1' THEN
+						TG68_PC <= fpu_next_pc;
 					ELSIF exec(ea_to_pc)='1' THEN
 						TG68_PC <= addr;
 					ELSIF (state ="00" OR TG68_PC_brw = '1') AND stop='0'  THEN				
@@ -1190,7 +1225,7 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 						trap_berr <= '0';
 					-- a displacement byte of $FF selects the 32-bit form only on the
 					-- 68020 and later; on the 68000 and 68010 it is -1 (PRM, Bcc)
-					ELSIF opcode(7 downto 0)="00000000" OR (opcode(7 downto 0)="11111111" AND cpu(1)='1') OR data_is_source='1' THEN
+					ELSIF opcode(7 downto 0)="00000000" OR (opcode(7 downto 0)="11111111" AND cpu(1)='1') OR data_is_source='1' OR fpu_fbcc='1' THEN
 						TG68_PC_word <= '1';
 					END IF;	
 					
@@ -1502,7 +1537,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		 SVmode, preSVmode, stop, long_done, ea_only, setstate, addrvalue, execOPC, exec_write_back, exe_datatype,
 		 datatype, interrupt, c_out, trapmake, rot_cnt, brief, addr, trap_trapv, last_data_in, use_VBR_Stackframe,
 		 long_start, set_datatype, sndOPC, set_exec, exec, ea_build_now, reg_QA, reg_QB, make_berr, trap_berr,
-		 cpu040, m16_done)
+		 cpu040, m16_done, fpu_ins, fpu_gen, fpu_memea, fpu_fbcc, fpu_unimpl, fpu_done)
 	BEGIN
 		TG68_PC_brw <= '0';	
 		setstate <= "00";
@@ -3186,7 +3221,53 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 				-- PRM): the core has no caches and no MMU, so CINV, CPUSH,
 				-- PFLUSH and PTEST only check the privilege (PTEST leaves MMUSR
 				-- alone); scope 00 of CINV and CPUSH is not an instruction
-				IF cpu040='1' AND opcode(11 downto 8)="0100" THEN		--CINV, CPUSH
+				IF cpu040='1' AND opcode(11 downto 9)="001" THEN			--FPU (coprocessor 1)
+					IF fpu_fbcc='1' THEN
+						-- FBcc: Bcc.W or Bcc.L with the condition of the FPCC
+						datatype <= "10";
+						IF micro_state=idle THEN
+							next_micro_state <= bra1;
+							IF opcode(6)='1' THEN
+								set(longaktion) <= '1';
+							END IF;
+						END IF;
+					ELSIF fpu_ins='0' THEN
+						-- FScc, FDBcc, FTRAPcc and the rest: not yet
+						trap_1111 <= '1';
+						trapmake <= '1';
+					ELSIF opcode(8)='1' AND SVmode='0' THEN
+						trap_priv <= '1';						-- FSAVE, FRESTORE
+						trapmake <= '1';
+					ELSIF decodeOPC='1' AND fpu_gen='1' AND fpu_unimpl='1' THEN
+						trap_1111 <= '1';						-- left to the M68040FPSP
+						trapmake <= '1';
+					ELSE
+						IF fpu_memea='1' THEN
+							-- the kernel's effective address modes, as PEA builds them;
+							-- after a command word one cycle later, as CAS2 does
+							ea_only <= '1';
+							datatype <= "10";
+							IF decodeOPC='1' THEN
+								IF fpu_gen='1' THEN
+									set(ea_build) <= '1';
+									next_micro_state <= nop;
+								ELSE
+									ea_build_now <= '1';
+								END IF;
+							END IF;
+							IF set(get_ea_now)='1' THEN
+								setstate <= "01";
+							END IF;
+							IF nextpass='1' AND micro_state=idle THEN
+								setstate <= "01";
+								next_micro_state <= fpu_go;
+							END IF;
+						ELSIF decodeOPC='1' THEN
+							setstate <= "01";
+							next_micro_state <= fpu_go;
+						END IF;
+					END IF;
+				ELSIF cpu040='1' AND opcode(11 downto 8)="0100" THEN		--CINV, CPUSH
 					IF opcode(4 downto 3)="00" THEN
 						trap_1111 <= '1';
 						trapmake <= '1';
@@ -3945,6 +4026,20 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 					setstackaddr <= '1';
 					set(Regwrena) <= '1';
 					
+				WHEN fpu_go =>		-- FPU: TG68K_FPU starts on this edge
+					setstate <= "01";
+					next_micro_state <= fpu_wait;
+				WHEN fpu_wait =>
+					setstate <= "01";
+					IF fpu_done='1' THEN
+						next_micro_state <= fpu_end;
+					ELSE
+						next_micro_state <= fpu_wait;
+					END IF;
+				WHEN fpu_end =>		-- go on at the next instruction (fpu_jump)
+					setstate <= "00";
+					next_micro_state <= nop;
+
 				WHEN m16_abs =>		-- MOVE16: fetch the low word of the address
 					setstate <= "01";
 					next_micro_state <= m16_go;
@@ -4126,6 +4221,128 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 	END PROCESS;
 
 -----------------------------------------------------------------------------
+-- 68040 FPU
+-----------------------------------------------------------------------------
+  fpu_fbcc <= '1' WHEN cpu040='1' AND opcode(15 downto 7)="111100101" ELSE '0';
+  fpu_gen <= '1' WHEN cpu040='1' AND opcode(15 downto 6)="1111001000" ELSE '0';
+  fpu_ins <= '1' WHEN cpu040='1' AND opcode(15 downto 9)="1111001" AND
+                      (opcode(8 downto 6)="000" OR opcode(8 downto 6)="100" OR opcode(8 downto 6)="101") ELSE '0';
+  -- (d16,An), (d8,An,Xn), absolute and PC-relative modes
+  fpu_memea <= '1' WHEN opcode(5 downto 3)="101" OR opcode(5 downto 3)="110" OR
+                        (opcode(5 downto 3)="111" AND opcode(2)='0') ELSE '0';
+  fpu_pred <= exe_opcode(5 downto 0);
+  fpu_start <= '1' WHEN micro_state=fpu_go ELSE '0';
+  fpu_jump <= '1' WHEN micro_state=fpu_end ELSE '0';
+  fpu_rd_data <= regfile(fpu_rd_idx);
+
+  -- the command word of a cpGEN instruction is on data_read during its
+  -- decode; what the 68040 does not do in hardware takes Line-F there
+  -- (M68040 User's Manual table 9-10, packed decimal, FMOVECR, dynamic
+  -- FMOVEM lists, which this unit does not do either)
+  process (data_read)
+	variable c : std_logic_vector(15 downto 0);
+  begin
+	c := data_read(15 downto 0);
+	fpu_unimpl <= '0';
+	case c(15 downto 13) is
+	  when "000" | "010" =>
+		case c(6 downto 0) is
+		  when "0000000" | "1000000" | "1000100" | "0011000" | "1011000" | "1011100" |
+			   "0011010" | "1011010" | "1011110" | "0000100" | "1000001" | "1000101" |
+			   "0100010" | "1100010" | "1100110" | "0101000" | "1101000" | "1101100" |
+			   "0100011" | "1100011" | "1100111" | "0100000" | "1100000" | "1100100" |
+			   "0111000" | "0111010" => null;
+		  when others => fpu_unimpl <= '1';
+		end case;
+		if c(14) = '1' and (c(12 downto 10) = "011" or c(12 downto 10) = "111") then
+		  fpu_unimpl <= '1';
+		end if;
+	  when "011" =>
+		if c(12 downto 10) = "011" or c(12 downto 10) = "111" then
+		  fpu_unimpl <= '1';
+		end if;
+	  when "110" | "111" =>
+		-- mode bit 11 set: a dynamic register list in Dn
+		if c(11) = '1' then
+		  fpu_unimpl <= '1';
+		end if;
+	  when "100" | "101" => null;
+	  when others => fpu_unimpl <= '1';
+	end case;
+  end process;
+
+  -- effective address: built by the kernel (captured when PEA would write
+  -- it) or, for #imm, after the command word
+  process (clk)
+  begin
+	if rising_edge(clk) then
+	  if clkena_lw = '1' and exec(get_ea_now) = '1' and fpu_ins = '1' then
+		fpu_ea_r <= addr;
+	  end if;
+	end if;
+  end process;
+  -- the PC-relative modes take the PC of the extension word as base, but
+  -- the kernel builds them from the PC of the command word in front of it
+  fpu_ea <= exe_pc + 5 WHEN opcode(5 downto 0)="111100" AND sndOPC(12 downto 10)="110" ELSE
+            exe_pc + 4 WHEN opcode(5 downto 0)="111100" ELSE
+            fpu_ea_r + 2 WHEN fpu_gen='1' AND opcode(5 downto 1)="11101" ELSE fpu_ea_r;
+
+  -- bytes after the opcode (and command word): extension words of the
+  -- effective address, or the immediate data
+  process (opcode, sndOPC, brief)
+	variable n : integer range 0 to 16;
+  begin
+	n := 0;
+	case opcode(5 downto 3) is
+	  when "101" => n := 2;
+	  when "110" =>
+		n := 2;
+		if brief(8) = '1' then
+		  if brief(5 downto 4) = "10" then n := n + 2; elsif brief(5 downto 4) = "11" then n := n + 4; end if;
+		  if brief(1 downto 0) = "10" then n := n + 2; elsif brief(1 downto 0) = "11" then n := n + 4; end if;
+		end if;
+	  when "111" =>
+		case opcode(2 downto 0) is
+		  when "000" | "010" => n := 2;
+		  when "001" => n := 4;
+		  when "011" =>
+			n := 2;
+			if brief(8) = '1' then
+			  if brief(5 downto 4) = "10" then n := n + 2; elsif brief(5 downto 4) = "11" then n := n + 4; end if;
+			  if brief(1 downto 0) = "10" then n := n + 2; elsif brief(1 downto 0) = "11" then n := n + 4; end if;
+			end if;
+		  when "100" =>
+			if sndOPC(15 downto 13) = "100" then
+			  n := 0;
+			  if sndOPC(12) = '1' then n := n + 4; end if;
+			  if sndOPC(11) = '1' then n := n + 4; end if;
+			  if sndOPC(10) = '1' then n := n + 4; end if;
+			else
+			  case sndOPC(12 downto 10) is
+				when "000" | "001" => n := 4;
+				when "010" | "011" => n := 12;
+				when "101" => n := 8;
+				when others => n := 2;
+			  end case;
+			end if;
+		  when others => n := 0;
+		end case;
+	  when others => n := 0;
+	end case;
+	fpu_ext <= n;
+  end process;
+  fpu_next_pc <= exe_pc + 4 + fpu_ext WHEN opcode(8 downto 6)="000" ELSE exe_pc + 2 + fpu_ext;
+
+  fpu : entity work.TG68K_FPU
+	port map (clk => clk, reset => Reset, clkena => clkena_lw, start => fpu_start,
+			  opcode => opcode, cmd => sndOPC, ea => fpu_ea, iaddr => exe_pc, done => fpu_done,
+			  rd_idx => fpu_rd_idx, rd_data => fpu_rd_data, wr_en => fpu_wr_en, wr_idx => fpu_wr_idx,
+			  wr_data => fpu_wr_data, wr_size => fpu_wr_size, bus_act => fpu_bus_act,
+			  bus_addr => fpu_bus_addr, bus_wr => fpu_bus_wr, bus_uds_n => fpu_uds_n,
+			  bus_lds_n => fpu_lds_n, bus_wdata => fpu_bus_wdata, data_in => data_in,
+			  pred => fpu_pred, pred_true => fpu_pred_true);
+
+-----------------------------------------------------------------------------
 -- MOVE16 (68040)
 --   1111 0110 0010 0xxx, 1xxx 0000 0000 0000   (Ax)+,(Ay)+
 --   1111 0110 000o oyyy, address.L              00 (Ay)+,(xxx).L
@@ -4287,7 +4504,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 -----------------------------------------------------------------------------
 -- Conditions
 -----------------------------------------------------------------------------
-PROCESS (exe_opcode, Flags)
+PROCESS (exe_opcode, Flags, fpu_pred_true, cpu040)
 	BEGIN
 		CASE exe_opcode(11 downto 8) IS
 			WHEN X"0" => exe_condition <= '1';
@@ -4308,6 +4525,9 @@ PROCESS (exe_opcode, Flags)
 			WHEN X"f" => exe_condition <= (Flags(3) AND NOT Flags(1)) OR (NOT Flags(3) AND Flags(1)) OR Flags(2);
 			WHEN OTHERS => NULL;
 		END CASE;
+		IF cpu040='1' AND exe_opcode(15 downto 7)="111100101" THEN
+			exe_condition <= fpu_pred_true;
+		END IF;
 	END PROCESS;
 	
 -----------------------------------------------------------------------------
