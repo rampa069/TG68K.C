@@ -51,6 +51,7 @@ entity TG68K_FPU is
 		clkena    : in  std_logic;
 		-- instruction
 		start     : in  std_logic;
+		abort     : in  std_logic := '0';			-- access error: drop the instruction
 		opcode    : in  std_logic_vector(15 downto 0);
 		cmd       : in  std_logic_vector(15 downto 0);
 		ea        : in  std_logic_vector(31 downto 0);	-- modes 5, 6, 7: the operand address
@@ -427,6 +428,13 @@ begin
 				unsupp_r <= '0';
 				alu_start <= '0';
 				wr_en <= '0';
+				if abort = '1' then
+					-- an access error on one of its bus cycles: the kernel restores
+					-- the integer registers and restarts the instruction
+					state <= ST_FINISH;
+					xframe <= '0';
+					xrframe <= '0';
+				else
 				if pred_bsun = '1' and pred(4) = '1' and fpsr(24) = '1' then
 					fpsr(15) <= '1';		-- BSUN, and AEXC IOP
 					fpsr(7) <= '1';
@@ -1036,6 +1044,7 @@ begin
 				when ST_FINISH =>
 					state <= IDLE;
 				end case;
+				end if;
 			end if;
 		end if;
 	end process;
