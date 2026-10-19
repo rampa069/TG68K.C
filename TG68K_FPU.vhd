@@ -71,7 +71,8 @@ entity TG68K_FPU is
 		data_in   : in  std_logic_vector(15 downto 0);
 		-- conditional predicates (FBcc, FScc, FDBcc, FTRAPcc)
 		pred      : in  std_logic_vector(5 downto 0);
-		pred_true : out std_logic
+		pred_true : out std_logic;
+		pred_bsun : in  std_logic := '0'					-- FBcc evaluated pred: set BSUN on a NaN
 	);
 end entity;
 
@@ -368,6 +369,10 @@ begin
 				unimp_r <= '0';
 				alu_start <= '0';
 				wr_en <= '0';
+				if pred_bsun = '1' and pred(4) = '1' and fpsr(24) = '1' then
+					fpsr(15) <= '1';		-- BSUN, and AEXC IOP
+					fpsr(7) <= '1';
+				end if;
 				case state is
 				when IDLE =>
 					br_r <= '0';

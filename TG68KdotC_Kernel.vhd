@@ -407,7 +407,7 @@ architecture logic of TG68KdotC_Kernel is
 	signal fpu_start, fpu_done, fpu_jump : std_logic;
 	signal fpu_br : std_logic;
 	signal fpu_unimp, fpu_trap2, fpu_tf : std_logic := '0';
-	signal fpu_ftrap, fpu_ftrapcc, fpu_tfp : std_logic := '0';
+	signal fpu_ftrap, fpu_ftrapcc, fpu_tfp, fpu_bsun : std_logic := '0';
 	signal fpu_ea_out : std_logic_vector(31 downto 0);
 	signal fpu_br_target, fpu_target : std_logic_vector(31 downto 0);
 	signal fpu_ea_r, fpu_ea, fpu_next_pc : std_logic_vector(31 downto 0);
@@ -4332,6 +4332,8 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
   fpu_pred <= exe_opcode(5 downto 0);
   fpu_start <= '1' WHEN micro_state=fpu_go ELSE '0';
   fpu_jump <= '1' WHEN micro_state=fpu_end ELSE '0';
+  -- FBcc tests its predicate in bra1: a signaling one on a NaN sets BSUN
+  fpu_bsun <= '1' WHEN micro_state=bra1 AND cpu040='1' AND exe_opcode(15 downto 7)="111100101" ELSE '0';
   fpu_trap2 <= '1' WHEN micro_state=fpu_wait AND fpu_done='1' AND fpu_unimp='1' ELSE '0';
   -- marks the exception entry of an unimplemented FP instruction
   process (clk)
@@ -4490,7 +4492,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 			  wr_data => fpu_wr_data, wr_size => fpu_wr_size, bus_act => fpu_bus_act,
 			  bus_addr => fpu_bus_addr, bus_wr => fpu_bus_wr, bus_uds_n => fpu_uds_n,
 			  bus_lds_n => fpu_lds_n, bus_wdata => fpu_bus_wdata, data_in => data_in,
-			  pred => fpu_pred, pred_true => fpu_pred_true);
+			  pred => fpu_pred, pred_true => fpu_pred_true, pred_bsun => fpu_bsun);
 
 -----------------------------------------------------------------------------
 -- MOVE16 (68040)
