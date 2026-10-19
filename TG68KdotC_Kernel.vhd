@@ -398,6 +398,9 @@ architecture logic of TG68KdotC_Kernel is
 	signal ae_fix				: std_logic;					-- An of the faulting access to correct
 	signal ae_fix_idx			: integer range 0 to 15;
 	signal ae_fix_val			: std_logic_vector(31 downto 0);
+	signal ae_fix_r				: std_logic := '0';				-- the same, registered for ae_fix1
+	signal ae_fix_idx_r		: integer range 0 to 15;
+	signal ae_fix_val_r		: std_logic_vector(31 downto 0);
 	signal ae_read_done		: std_logic := '0';		-- a data read of this instruction completed
 	signal ae_faddr			: std_logic_vector(31 downto 0);	-- the fault address as the 68000 has it
 	signal ae_move_w			: std_logic;					-- a MOVE whose write faults
@@ -710,7 +713,7 @@ PROCESS (long_start, reg_QB, data_write_tmp, exec, data_read, data_write_mux, me
 -----------------------------------------------------------------------------
 -- Registerfile
 -----------------------------------------------------------------------------
-PROCESS (clk, regfile, RDindex_A, RDindex_B, exec, m16_last, m16_inc_x, m16_inc_y, m16_rx, m16_ry, ae_fix, ae_fix_idx, ae_fix_val,
+PROCESS (clk, regfile, RDindex_A, RDindex_B, exec, m16_last, m16_inc_x, m16_inc_y, m16_rx, m16_ry, ae_fix_r, ae_fix_idx_r, ae_fix_val_r, micro_state,
 		 fpu_wr_en, fpu_wr_size, fpu_wr_idx, fpu_wr_data)
 	BEGIN
 		reg_QA <= regfile(RDindex_A);
@@ -724,8 +727,8 @@ PROCESS (clk, regfile, RDindex_A, RDindex_B, exec, m16_last, m16_inc_x, m16_inc_
 				IF Wwrena='1' THEN
 					regfile(RDindex_A) <= regin;
 				END IF;
-				IF ae_fix='1' THEN
-					regfile(ae_fix_idx) <= ae_fix_val;
+				IF ae_fix_r='1' AND micro_state=ae_fix1 THEN
+					regfile(ae_fix_idx_r) <= ae_fix_val_r;
 				END IF;
 				IF fpu_wr_en='1' THEN
 					CASE fpu_wr_size IS
@@ -799,7 +802,7 @@ PROCESS (OP1in, reg_QA, Regwrena_now, Bwrena, Lwrena, exe_datatype, WR_AReg, mov
 -----------------------------------------------------------------------------
 -- set dest regaddr
 -----------------------------------------------------------------------------
-PROCESS (opcode, rf_source_addrd, brief, setstackaddr, dest_hbits, dest_areg, dest_LDRareg, data_is_source, sndOPC, exec, set, dest_2ndHbits, dest_2ndLbits, dest_LDRHbits, dest_LDRLbits, last_data_read)
+PROCESS (opcode, rf_source_addrd, brief, setstackaddr, dest_hbits, dest_areg, dest_LDRareg, data_is_source, sndOPC, exec, set, dest_2ndHbits, dest_2ndLbits, dest_LDRHbits, dest_LDRLbits, last_data_read, ae_now, preSVmode)
 	BEGIN
 		IF exec(movem_action) ='1' THEN
 			rf_dest_addr <= rf_source_addrd;
@@ -830,6 +833,9 @@ PROCESS (opcode, rf_source_addrd, brief, setstackaddr, dest_hbits, dest_areg, de
 				rf_dest_addr <= '1'&opcode(2 downto 0);
 			END IF;
 		END IF;	
+			IF ae_now='1' AND preSVmode='0' THEN
+			rf_dest_addr <= "1111";		-- address error from user mode: A7 for the swap
+		END IF;
 	END PROCESS;
 	
 -----------------------------------------------------------------------------
@@ -1113,7 +1119,7 @@ PROCESS (clk, setdisp, memaddr_a, briefdata, memaddr_delta, setdispbyte, datatyp
 				IF trap_interrupt='1' or set_vectoraddr = '1' THEN
 					trap_vector(9 downto 0) <= IPL_vec & "00";      --TH
 				END IF;	
-				IF trap_addr_error='1' THEN		-- over a CHK still in exec
+				IF ae_now='1' THEN		-- address error, over anything else this cycle
 					trap_vector(9 downto 0) <= "00" & X"0C";
 				END IF;
 			END IF;
@@ -1206,7 +1212,7 @@ PROCESS (clk, setdisp, memaddr_a, briefdata, memaddr_delta, setdispbyte, datatyp
 -- PC Calc + fetch opcode
 -----------------------------------------------------------------------------
 PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data, next_micro_state, stop, make_trace, make_berr, IPL_nr, nmi_pending, FlagsSR, set_rot_cnt, opcode, writePCbig, set_exec, exec,
-        PC_dataa, PC_datab, setnextpass, last_data_read, TG68_PC_brw, TG68_PC_word, Z_error, trap_trap, trap_trapv, interrupt, tmp_TG68_PC, TG68_PC, use_VBR_Stackframe, writePCnext)
+        PC_dataa, PC_datab, setnextpass, last_data_read, TG68_PC_brw, TG68_PC_word, Z_error, trap_trap, trap_trapv, interrupt, tmp_TG68_PC, TG68_PC, use_VBR_Stackframe, writePCnext, ae_now)
 	BEGIN
 	
 		PC_dataa <= TG68_PC;
@@ -1260,6 +1266,13 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 		setexecOPC <= '0';
 		IF setstate="00" AND next_micro_state=idle AND set_direct_data='0' AND (exec_write_back='0' OR (state="10" AND addrvalue='0')) THEN
 			setexecOPC <= '1';
+		END IF;
+		IF ae_now='1' THEN
+			-- an address error ends the instruction here: no next opcode
+			setendOPC <= '0';
+			setopcode <= '0';
+			setinterrupt <= '0';
+			setexecOPC <= '0';
 		END IF;
 		
 		IPL_nr <= NOT IPL;
@@ -1500,6 +1513,15 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 					exec_tas <= set_exec_tas;
 				END IF;	
 				exec(get_2ndOPC) <= set(get_2ndOPC) OR setopcode;
+				IF ae_now='1' THEN
+					exec <= (OTHERS => '0');	-- the aborted instruction does no more
+					IF preSVmode='0' THEN
+						-- from user mode: A7 and USP are swapped next, as changeMode does
+						exec(changeMode) <= '1';
+						exec(to_USP) <= '1';
+						exec(from_USP) <= '1';
+					END IF;
+				END IF;
 			END IF;	
 		END IF;	
 	END PROCESS;
@@ -1609,7 +1631,15 @@ PROCESS (clk, Reset, FlagsSR, last_data_read, OP2out, exec)
 					FlagsSR(7) <= '0';
 				END IF;
 				IF ae_now='1' THEN
-					FlagsSR(5) <= '1';		-- (an RTE may have loaded a user SR already)
+					-- address error entry: S set (an RTE may have loaded a user SR
+					-- already), T cleared, and the switch to the supervisor stack
+					FlagsSR(5) <= '1';
+					FlagsSR(7) <= '0';
+					make_trace <= '0';
+					IF preSVmode='0' THEN
+						preSVmode <= '1';
+						FC(2) <= '1';
+					END IF;
 				END IF;
 				IF set(changeMode)='1' THEN
 					preSVmode <= NOT preSVmode;
@@ -1684,7 +1714,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		 datatype, interrupt, c_out, trapmake, rot_cnt, brief, addr, trap_trapv, last_data_in, use_VBR_Stackframe,
 		 long_start, set_datatype, sndOPC, set_exec, exec, ea_build_now, reg_QA, reg_QB, make_berr, trap_berr,
 		 cpu040, m16_done, fpu_ins, fpu_gen, fpu_memea, fpu_fbcc, fpu_unimpl, fpu_done, mmu_ptest_done,
-		 fpu_unimp, fpu_trap2, fpu_ftrap, ae_now, ae_frame)
+		 fpu_unimp, fpu_trap2, fpu_ftrap)
 	BEGIN
 		TG68_PC_brw <= '0';	
 		setstate <= "00";
@@ -3582,7 +3612,11 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 				micro_state <= ld_nn;
 			ELSIF clkena_lw='1' THEN
 				trapd <= trapmake;
-				micro_state <= next_micro_state;
+				IF ae_now='1' THEN
+					micro_state <= ae_fix1;		-- address error: then trap0 or trap00
+				ELSE
+					micro_state <= next_micro_state;
+				END IF;
 			END IF;
 		END IF;
 
@@ -4188,6 +4222,13 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 					ELSE
 						next_micro_state <= mmu_ptest2;
 					END IF;
+				WHEN ae_fix1 =>		-- address error: the register correction is written
+					setstate <= "01";
+					IF cpu040='1' THEN
+						next_micro_state <= trap00;		-- format $2
+					ELSE
+						next_micro_state <= trap0;
+					END IF;
 				WHEN fpu_go =>		-- FPU: TG68K_FPU starts on this edge
 					setstate <= "01";
 					next_micro_state <= fpu_wait;
@@ -4391,40 +4432,6 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 			END CASE;
 
 
-			-- address error: drop what the instruction would do next and start
-			-- exception processing (the frame is pushed by trap0, trap2 and
-			-- trap4-6, as for the 68000 bus error)
-			IF ae_now='1' THEN
-				set <= (OTHERS => '0');
-				set_exec <= (OTHERS => '0');
-				setstate <= "01";
-				IF cpu040='1' THEN
-					next_micro_state <= trap00;		-- format $2
-				ELSE
-					next_micro_state <= trap0;
-				END IF;
-				trap_addr_error <= '1';
-				trapmake <= '0';
-				trap_illegal <= '0';
-				trap_priv <= '0';
-				trap_1010 <= '0';
-				trap_1111 <= '0';
-				trap_trap <= '0';
-				trap_trapv <= '0';
-				set_Z_error <= '0';
-				set_stop <= '0';
-				writePC <= '0';
-				setstackaddr <= '0';
-				set_vectoraddr <= '0';
-				IF preSVmode='0' THEN
-					set(changeMode) <= '1';
-				END IF;
-			END IF;
-			-- nothing of the aborted instruction may execute during the
-			-- exception processing (its opcode is still decoded)
-			IF ae_frame='1' THEN
-				set_exec <= (OTHERS => '0');
-			END IF;
 	END PROCESS;
 
 -----------------------------------------------------------------------------
@@ -4444,6 +4451,9 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 	  elsif clkena_core = '1' then
 		if ae_now = '1' then
 		  ae_frame <= '1';
+		  ae_fix_r <= ae_fix;
+		  ae_fix_idx_r <= ae_fix_idx;
+		  ae_fix_val_r <= ae_fix_val;
 		  ae_addr <= ae_faddr;
 		  ae_ir <= opcode;
 		  if ae_ccr_force = '1' then
