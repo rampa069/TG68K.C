@@ -397,6 +397,12 @@ architecture logic of TG68KdotC_Kernel is
 	signal ae_status			: std_logic_vector(15 downto 0);
 	signal ae_ir				: std_logic_vector(15 downto 0);
 	signal ae_sr				: std_logic_vector(15 downto 0);
+	-- 68010 and 68020 frames: the words below the format word, pushed by
+	-- ae_push from the last (ae_cnt) to the first (index 0, at SP+8)
+	signal ae_cnt				: integer range 0 to 31;
+	signal ae_xword			: std_logic_vector(15 downto 0);
+	signal ae_ssw				: std_logic_vector(15 downto 0);
+	signal ae_dob				: std_logic_vector(15 downto 0);	-- data output buffer
 	signal ae_ccr_force		: std_logic;
 	signal ae_ccr				: std_logic_vector(4 downto 0);
 	signal ccr_force			: std_logic;
@@ -546,8 +552,8 @@ ALU: TG68K_ALU
 	-- the 68040 traps only an instruction prefetch at an odd address (M68040
 	-- User's Manual 8.2.2); its data accesses may be misaligned
 	ae_now <= '1' WHEN ae_frame='0' AND addr(0)='1' AND fpu_bus_act='0' AND m16_active='0' AND
-	                   ((cpu="00" AND (state="00" OR (state(1)='1' AND memmask(5)='1' AND memmask(3)='0'))) OR
-	                    (cpu040='1' AND state="00")) ELSE '0';
+	                   ((cpu(1)='0' AND (state="00" OR (state(1)='1' AND memmask(5)='1' AND memmask(3)='0'))) OR
+	                    (cpu(1)='1' AND state="00")) ELSE '0';
 
 	nwr_l <= '1' WHEN ae_now='1' ELSE
 	       NOT fpu_bus_wr WHEN fpu_bus_act='1' ELSE
@@ -985,7 +991,15 @@ PROCESS (clk)
 					useStackframe2 <= '1';
 				ELSIF ae_frame='1' AND cpu040='1' AND micro_state=trap1 THEN
 					data_write_tmp <= exe_pc;				-- the instruction that caused it
-				ELSIF ae_frame='1' AND cpu040='0' AND micro_state=trap0 THEN
+				ELSIF ae_frame='1' AND cpu="00" AND micro_state=trap0 THEN
+					data_write_tmp <= ae_pc;
+				ELSIF ae_frame='1' AND micro_state=ae_push THEN
+					data_write_tmp(15 downto 0) <= ae_xword;
+				ELSIF ae_frame='1' AND cpu="01" AND micro_state=trap0 THEN
+					data_write_tmp(15 downto 0) <= "1000" & trap_vector(11 downto 0);	-- format $8
+				ELSIF ae_frame='1' AND cpu="11" AND micro_state=trap0 THEN
+					data_write_tmp(15 downto 0) <= "1010" & trap_vector(11 downto 0);	-- format $A
+				ELSIF ae_frame='1' AND cpu040='0' AND micro_state=trap1 THEN
 					data_write_tmp <= ae_pc;
 				ELSIF ae_frame='1' AND micro_state=trap2 THEN
 					-- the SR at the fault (after an RTE, the new one)
@@ -4264,8 +4278,20 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 					setstate <= "01";
 					IF cpu040='1' THEN
 						next_micro_state <= trap00;		-- format $2
+					ELSIF cpu(0)='1' THEN
+						next_micro_state <= ae_push;	-- format $8 or $A
 					ELSE
 						next_micro_state <= trap0;
+					END IF;
+				WHEN ae_push =>		-- address error, 68010 and 68020: one frame word
+					set(presub) <= '1';
+					setstackaddr <= '1';
+					setstate <= "11";
+					datatype <= "01";
+					IF ae_cnt=0 THEN
+						next_micro_state <= trap0;
+					ELSE
+						next_micro_state <= ae_push;
 					END IF;
 				WHEN fpu_go =>		-- FPU: TG68K_FPU starts on this edge
 					setstate <= "01";
@@ -4473,6 +4499,27 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 	END PROCESS;
 
 -----------------------------------------------------------------------------
+-- The words of the 68010 format $8 frame (MC68000 UM figure 6-8) and the
+-- 68020 format $A frame (MC68020 UM table 6-5) below the format word,
+-- index 0 at SP+8. Internal and reserved words are zero.
+-----------------------------------------------------------------------------
+  process (cpu, ae_cnt, ae_ssw, ae_addr, ae_dob)
+  begin
+	ae_xword <= (others => '0');
+	if cpu(1) = '1' then
+	  if ae_cnt = 1 then ae_xword <= ae_ssw; end if;		-- SP+$0A
+	else
+	  case ae_cnt is
+		when 0 => ae_xword <= ae_ssw;						-- SP+$08
+		when 1 => ae_xword <= ae_addr(31 downto 16);		-- fault address
+		when 2 => ae_xword <= ae_addr(15 downto 0);
+		when 4 => ae_xword <= ae_dob;						-- SP+$10, data output buffer
+		when others => null;
+	  end case;
+	end if;
+  end process;
+
+-----------------------------------------------------------------------------
 -- Address error frame (68000). Status word: R/W (1 = read), I/N (1 for an
 -- instruction fetch, as the SingleStepTests vectors have it) and the
 -- function code, with bits 15-5 of the instruction register above them
@@ -4494,6 +4541,27 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		  ae_fix_val_r <= ae_fix_val;
 		  ae_addr <= ae_faddr;
 		  ae_ir <= opcode;
+		  if state = "11" then
+			-- the word as an aligned access would carry it (the write mux
+			-- shifts an odd access by a byte)
+			if memmask(2) = '0' then
+			  ae_dob <= data_write_muxin(31 downto 16);
+			else
+			  ae_dob <= data_write_muxin(15 downto 0);
+			end if;
+		  else
+			ae_dob <= (others => '0');
+		  end if;
+		  if cpu(1) = '1' then
+			-- 68020: RC and RB, the pipeline refilled (MC68020 UM 6.2.1)
+			ae_ssw <= X"3000";
+		  elsif state = "00" then
+			-- 68010: IF, read, the function code (MC68000 UM figure 6-9)
+			ae_ssw <= "0010000100000" & FlagsSR(5) & "10";
+		  else
+			-- 68010 data: DF and RW for a read, neither for a write
+			ae_ssw <= "000" & (NOT state(0)) & "000" & (NOT state(0)) & "00000" & FlagsSR(5) & "01";
+		  end if;
 		  if ae_ccr_force = '1' then
 			ae_sr <= FlagsSR & "000" & ae_ccr;
 		  else
@@ -4501,7 +4569,11 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		  end if;
 		  if state = "00" then
 			ae_status <= opcode(15 downto 5) & "11" & FlagsSR(5) & "10";	-- program
-			ae_pc <= addr - 4;
+			if cpu(1) = '1' then
+			  ae_pc <= addr;		-- 68020: the next instruction (UM table 6-5)
+			else
+			  ae_pc <= addr - 4;
+			end if;
 		  else
 			ae_status <= opcode(15 downto 5) & (NOT state(0)) & '0' & FlagsSR(5) & "01";	-- data
 			if ae_move_w = '1' then
@@ -4523,6 +4595,13 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		  end if;
 		elsif setopcode = '1' and clkena_lw = '1' then
 		  ae_frame <= '0';
+		end if;
+		if clkena_lw = '1' then
+		  if micro_state = ae_fix1 then
+			if cpu(1) = '1' then ae_cnt <= 11; else ae_cnt <= 24; end if;
+		  elsif micro_state = ae_push and ae_cnt /= 0 then
+			ae_cnt <= ae_cnt - 1;
+		  end if;
 		end if;
 		-- the first data read of an instruction (ADDX/SUBX/CMPM: the source)
 		if decodeOPC = '1' then
