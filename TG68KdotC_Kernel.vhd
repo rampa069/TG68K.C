@@ -284,6 +284,10 @@ architecture logic of TG68KdotC_Kernel is
 	signal trap_trace			: bit;
 	signal trap_1010			: bit;
 	signal trap_1111			: bit;
+	signal trap_fmt			: bit;					-- RTE with a frame format it cannot restore
+	signal fmt_err				: std_logic := '0';		-- the format error frame is being built
+	signal rte_ccr				: std_logic_vector(7 downto 0);	-- the CCR before an RTE
+	signal rte_sr				: std_logic_vector(7 downto 0);	-- the SR before an RTE
 	signal trap_trap			: bit;
 	signal trap_trapv			: bit;
 	signal trap_interrupt	: bit;
@@ -395,6 +399,8 @@ architecture logic of TG68KdotC_Kernel is
 	signal ae_sr				: std_logic_vector(15 downto 0);
 	signal ae_ccr_force		: std_logic;
 	signal ae_ccr				: std_logic_vector(4 downto 0);
+	signal ccr_force			: std_logic;
+	signal ccr_val				: std_logic_vector(4 downto 0);
 	signal ae_fix				: std_logic;					-- An of the faulting access to correct
 	signal ae_fix_idx			: integer range 0 to 15;
 	signal ae_fix_val			: std_logic_vector(31 downto 0);
@@ -502,8 +508,8 @@ ALU: TG68K_ALU
 
 		set_V_Flag => set_V_Flag,			--: buffer bit;
 		Flags => Flags,					 	--: buffer std_logic_vector(8 downto 0);
-		ccr_force => ae_ccr_force,
-		ccr_val => ae_ccr,
+		ccr_force => ccr_force,
+		ccr_val => ccr_val,
 		c_out => c_out,					 	--: buffer std_logic_vector(2 downto 0);
 		addsub_q => addsub_q,				--: buffer std_logic_vector(31 downto 0);
 		ALUout => ALUout						--: buffer std_logic_vector(31 downto 0)
@@ -726,6 +732,9 @@ PROCESS (clk, regfile, RDindex_A, RDindex_B, exec, m16_last, m16_inc_x, m16_inc_
 				RDindex_B <= conv_integer(rf_source_addr(3 downto 0));
 				IF Wwrena='1' THEN
 					regfile(RDindex_A) <= regin;
+				END IF;
+				IF micro_state=rte_ferr THEN
+					regfile(15) <= regfile(15) - 8;		-- the frame stays on the stack
 				END IF;
 				IF ae_fix_r='1' AND micro_state=ae_fix1 THEN
 					regfile(ae_fix_idx_r) <= ae_fix_val_r;
@@ -998,6 +1007,8 @@ PROCESS (clk)
 					END IF;
 				ELSIF writePC='1' THEN
 					data_write_tmp <= TG68_PC;
+				ELSIF fmt_err='1' AND micro_state=trap1 THEN
+					data_write_tmp <= exe_pc;			-- format error: the RTE
 				ELSIF (fpu_tf='1' OR fpu_tfp='1') AND micro_state=trap1 THEN
 					data_write_tmp <= fpu_next_pc;		-- unimplemented FP, FTRAPcc: the next instruction
 				ELSIF exec(writePC_add)='1' THEN
@@ -1113,6 +1124,9 @@ PROCESS (clk, setdisp, memaddr_a, briefdata, memaddr_delta, setdispbyte, datatyp
 				IF trap_1111='1' THEN
 					trap_vector(9 downto 0) <= "00" & X"2C";
 				END IF;	
+				IF trap_fmt='1' THEN
+					trap_vector(9 downto 0) <= "00" & X"38";		-- format error
+				END IF;
 				IF trap_trap='1' THEN
 					trap_vector(9 downto 0) <= "0010" & opcode(3 downto 0) & "00";
 				END IF;	
@@ -1487,6 +1501,16 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 					IF decodeOPC='1' OR interrupt='1' THEN
 						trap_SR <= FlagsSR;
 					END IF;
+					-- the SR before an RTE, for its format error: taken on the edge
+					-- after the decode, once the previous instruction has written its
+					-- flags and before the RTE loads the SR it reads
+					IF exec(directSR)='1' THEN
+						rte_sr <= FlagsSR;
+						rte_ccr <= Flags;
+					END IF;
+					IF micro_state=rte_ferr THEN
+						trap_SR <= rte_sr;
+					END IF;
 				END IF;	
 			END IF;	
 		END IF;	
@@ -1630,6 +1654,9 @@ PROCESS (clk, Reset, FlagsSR, last_data_read, OP2out, exec)
 					make_trace <= '0';
 					FlagsSR(7) <= '0';
 				END IF;
+				IF micro_state=rte_ferr THEN
+					FlagsSR <= rte_sr;		-- the SR before the RTE
+				END IF;
 				IF ae_now='1' THEN
 					-- address error entry: S set (an RTE may have loaded a user SR
 					-- already), T cleared, and the switch to the supervisor stack
@@ -1756,6 +1783,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		trap_priv <='0';
 		trap_1010 <='0';
 		trap_1111 <='0';
+		trap_fmt <= '0';
 		trap_trap <='0';
 		trap_trapv <= '0';
 		trapmake <='0';
@@ -4191,7 +4219,14 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 					next_micro_state <= rte4;
 				WHEN rte4 =>         -- RTE
 											-- check for stack frame format #2
-					if last_data_in(15 downto 12)="0010" then
+					-- formats the core can restore: $0, $2 (68020 and later) and
+					-- $3 (68040, as long as $2); any other takes the format error
+					if last_data_in(15 downto 12)/="0000" and
+					   not (cpu(1)='1' and last_data_in(15 downto 12)="0010") and
+					   not (cpu040='1' and last_data_in(15 downto 12)="0011") then
+						setstate <= "01";
+						next_micro_state <= rte_ferr;
+					elsif last_data_in(15 downto 12)="0010" or last_data_in(15 downto 12)="0011" then
 										  -- read another 32 bits in this case
 						setstate <= "10"; -- read
 						datatype <= "10"; -- long word
@@ -4222,6 +4257,9 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 					ELSE
 						next_micro_state <= mmu_ptest2;
 					END IF;
+				WHEN rte_ferr =>	-- RTE format error: SP, SR and CCR back, then vector 14
+					trap_fmt <= '1';
+					trapmake <= '1';
 				WHEN ae_fix1 =>		-- address error: the register correction is written
 					setstate <= "01";
 					IF cpu040='1' THEN
@@ -4521,6 +4559,24 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		end case;
 	  when others => null;
 	end case;
+  end process;
+
+  ccr_force <= '1' WHEN ae_ccr_force='1' OR micro_state=rte_ferr ELSE '0';
+  ccr_val <= rte_ccr(4 downto 0) WHEN micro_state=rte_ferr ELSE ae_ccr;
+  -- the format error frame: format $0, the PC of the RTE
+  process (clk)
+  begin
+	if rising_edge(clk) then
+	  if Reset = '1' then
+		fmt_err <= '0';
+	  elsif clkena_lw = '1' then
+		if micro_state = rte_ferr then
+		  fmt_err <= '1';
+		elsif micro_state = trap3 then
+		  fmt_err <= '0';
+		end if;
+	  end if;
+	end if;
   end process;
 
   -- MOVE whose write faults: the 68000 has already set N and Z from the data
