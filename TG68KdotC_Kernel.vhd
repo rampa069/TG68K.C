@@ -390,6 +390,8 @@ architecture logic of TG68KdotC_Kernel is
 	signal fpu_fbcc				: std_logic;
 	signal fpu_unimpl			: std_logic;	-- the command word of an unimplemented one
 	signal fpu_start, fpu_done, fpu_jump : std_logic;
+	signal fpu_br : std_logic;
+	signal fpu_br_target, fpu_target : std_logic_vector(31 downto 0);
 	signal fpu_ea_r, fpu_ea, fpu_next_pc : std_logic_vector(31 downto 0);
 	signal fpu_ext				: integer range 0 to 16;	-- bytes of EA extension and immediate data
 	signal fpu_rd_idx, fpu_wr_idx : integer range 0 to 15;
@@ -1029,7 +1031,7 @@ PROCESS (clk, setdisp, memaddr_a, briefdata, memaddr_delta, setdispbyte, datatyp
 				ELSIF exec(direct_delta)='1' THEN
 					memaddr_delta_rega <= data_read;
 				ELSIF fpu_jump='1' THEN
-					memaddr_delta_rega <= fpu_next_pc;
+					memaddr_delta_rega <= fpu_target;
 				ELSIF exec(ea_to_pc)='1' AND setstate="00" THEN
 					memaddr_delta_rega <= addr;
 				ELSIF set(addrlong)='1' THEN
@@ -1167,7 +1169,7 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 					IF exec(directPC)='1' THEN
 						TG68_PC <= data_read;
 					ELSIF fpu_jump='1' THEN
-						TG68_PC <= fpu_next_pc;
+						TG68_PC <= fpu_target;
 					ELSIF exec(ea_to_pc)='1' THEN
 						TG68_PC <= addr;
 					ELSIF (state ="00" OR TG68_PC_brw = '1') AND stop='0'  THEN				
@@ -3238,7 +3240,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 					ELSIF opcode(8)='1' AND SVmode='0' THEN
 						trap_priv <= '1';						-- FSAVE, FRESTORE
 						trapmake <= '1';
-					ELSIF decodeOPC='1' AND fpu_gen='1' AND fpu_unimpl='1' THEN
+					ELSIF decodeOPC='1' AND fpu_gen='1' AND opcode(6)='0' AND fpu_unimpl='1' THEN
 						trap_1111 <= '1';						-- left to the M68040FPSP
 						trapmake <= '1';
 					ELSE
@@ -4224,9 +4226,12 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 -- 68040 FPU
 -----------------------------------------------------------------------------
   fpu_fbcc <= '1' WHEN cpu040='1' AND opcode(15 downto 7)="111100101" ELSE '0';
-  fpu_gen <= '1' WHEN cpu040='1' AND opcode(15 downto 6)="1111001000" ELSE '0';
-  fpu_ins <= '1' WHEN cpu040='1' AND opcode(15 downto 9)="1111001" AND
-                      (opcode(8 downto 6)="000" OR opcode(8 downto 6)="100" OR opcode(8 downto 6)="101") ELSE '0';
+  -- cpGEN and FScc/FDBcc have a command word or condition word after the opcode
+  fpu_gen <= '1' WHEN cpu040='1' AND opcode(15 downto 7)="111100100" AND
+                      NOT (opcode(6)='1' AND opcode(5 downto 3)="111" AND opcode(2 downto 1)/="00") ELSE '0';
+  -- FTRAPcc (F27A-F27C) is not among them yet
+  fpu_ins <= '1' WHEN fpu_gen='1' OR (cpu040='1' AND opcode(15 downto 7)="111100110" AND opcode(6)='0') OR
+                      (cpu040='1' AND opcode(15 downto 6)="1111001101") ELSE '0';
   -- (d16,An), (d8,An,Xn), absolute and PC-relative modes
   fpu_memea <= '1' WHEN opcode(5 downto 3)="101" OR opcode(5 downto 3)="110" OR
                         (opcode(5 downto 3)="111" AND opcode(2)='0') ELSE '0';
@@ -4283,7 +4288,8 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
   end process;
   -- the PC-relative modes take the PC of the extension word as base, but
   -- the kernel builds them from the PC of the command word in front of it
-  fpu_ea <= exe_pc + 5 WHEN opcode(5 downto 0)="111100" AND sndOPC(12 downto 10)="110" ELSE
+  fpu_ea <= exe_pc + 4 WHEN opcode(8 downto 6)="001" AND opcode(5 downto 3)="001" ELSE	-- FDBcc displacement
+            exe_pc + 5 WHEN opcode(5 downto 0)="111100" AND sndOPC(12 downto 10)="110" ELSE
             exe_pc + 4 WHEN opcode(5 downto 0)="111100" ELSE
             fpu_ea_r + 2 WHEN fpu_gen='1' AND opcode(5 downto 1)="11101" ELSE fpu_ea_r;
 
@@ -4294,6 +4300,8 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
   begin
 	n := 0;
 	case opcode(5 downto 3) is
+	  when "001" =>
+		if opcode(8 downto 6) = "001" then n := 2; end if;		-- FDBcc displacement
 	  when "101" => n := 2;
 	  when "110" =>
 		n := 2;
@@ -4331,11 +4339,13 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 	end case;
 	fpu_ext <= n;
   end process;
-  fpu_next_pc <= exe_pc + 4 + fpu_ext WHEN opcode(8 downto 6)="000" ELSE exe_pc + 2 + fpu_ext;
+  fpu_next_pc <= exe_pc + 4 + fpu_ext WHEN fpu_gen='1' ELSE exe_pc + 2 + fpu_ext;
+  fpu_target <= fpu_br_target WHEN fpu_br='1' ELSE fpu_next_pc;
 
   fpu : entity work.TG68K_FPU
 	port map (clk => clk, reset => Reset, clkena => clkena_lw, start => fpu_start,
 			  opcode => opcode, cmd => sndOPC, ea => fpu_ea, iaddr => exe_pc, done => fpu_done,
+			  br_take => fpu_br, br_target => fpu_br_target,
 			  rd_idx => fpu_rd_idx, rd_data => fpu_rd_data, wr_en => fpu_wr_en, wr_idx => fpu_wr_idx,
 			  wr_data => fpu_wr_data, wr_size => fpu_wr_size, bus_act => fpu_bus_act,
 			  bus_addr => fpu_bus_addr, bus_wr => fpu_bus_wr, bus_uds_n => fpu_uds_n,

@@ -15,6 +15,7 @@
 --          opclass 011 FMOVE FPn,<ea> (B W L S D X)
 --          opclass 100/101 FMOVE(M) <ea>,FPcr and FPcr,<ea>
 --          opclass 110/111 FMOVEM <ea>,list and list,<ea>
+--   FScc, FDBcc
 --   FSAVE (null or idle frame), FRESTORE
 -- What the 68040 leaves to the M68040FPSP (the transcendental functions,
 -- FINT, FINTRZ, FGETEXP, FGETMAN, FMOD, FREM, FSCALE, FSGL*, FMOVECR and
@@ -42,6 +43,8 @@ entity TG68K_FPU is
 																-- (for #imm, where the data starts)
 		iaddr     : in  std_logic_vector(31 downto 0);	-- address of the instruction (FPIAR)
 		done      : out std_logic;
+		br_take   : out std_logic;					-- with done: FDBcc branches
+		br_target : out std_logic_vector(31 downto 0);
 		-- integer register file
 		rd_idx    : out integer range 0 to 15;
 		rd_data   : in  std_logic_vector(31 downto 0);
@@ -75,7 +78,7 @@ architecture rtl of TG68K_FPU is
 	signal null_state : std_logic := '1';
 
 	type state_t is (IDLE, ST_REG, ST_EA, ST_SRC, ST_XFER, ST_XFER_DONE, ST_ALU, ST_ALU_WAIT,
-					 ST_STORE, ST_CTRL, ST_MOVEM, ST_MOVEM_W, ST_RESTORE, ST_FINISH);
+					 ST_STORE, ST_CTRL, ST_MOVEM, ST_MOVEM_W, ST_RESTORE, ST_DBCC, ST_FINISH);
 	signal state : state_t := IDLE;
 	signal ret_state : state_t;
 
@@ -112,6 +115,8 @@ architecture rtl of TG68K_FPU is
 	signal mptr : unsigned(31 downto 0);
 
 	signal done_r, unimp_r : std_logic := '0';
+	signal br_r : std_logic := '0';
+	signal brt : unsigned(31 downto 0);
 
 	-- memory formats to extended (an unnormal extended value is fine: the
 	-- arithmetic unit normalizes it)
@@ -212,45 +217,45 @@ architecture rtl of TG68K_FPU is
 		return n;
 	end function;
 
+	-- conditional predicates (M68000 PRM table 3-23) on N Z NAN of the FPCC;
+	-- bit 4 only selects the signaling form
+	function pred_eval(p : std_logic_vector(5 downto 0); n, z, nan : std_logic) return std_logic is
+	begin
+		case p(3 downto 0) is
+			when "0000" => return '0';
+			when "0001" => return z;
+			when "0010" => return not (nan or z or n);
+			when "0011" => return z or not (nan or n);
+			when "0100" => return n and not (nan or z);
+			when "0101" => return z or (n and not nan);
+			when "0110" => return not (nan or z);
+			when "0111" => return not nan;
+			when "1000" => return nan;
+			when "1001" => return nan or z;
+			when "1010" => return nan or not (n or z);
+			when "1011" => return nan or z or not n;
+			when "1100" => return nan or (n and not z);
+			when "1101" => return nan or z or n;
+			when "1110" => return not z;
+			when others => return '1';
+		end case;
+	end function;
+
 	function buf_long(b : bytes_t; i : integer) return std_logic_vector is
 	begin
 		return b(i) & b(i + 1) & b(i + 2) & b(i + 3);
 	end function;
 begin
 	done <= done_r;
+	br_take <= br_r;
+	br_target <= std_logic_vector(brt);
 
 	alu : entity work.TG68K_FPU_ALU
 		port map (clk => clk, reset => reset, ena => clkena, start => alu_start, op => alu_op, rmode => alu_rm,
 				  rprec => alu_rp, to_mem => alu_tomem, dst => alu_dst, src => alu_src,
 				  busy => alu_busy, done => alu_done, result => alu_res, exc => alu_exc);
 
-	-- conditional predicates (M68000 PRM table 3-23); bit 4 only selects the
-	-- signaling form, which would also set BSUN on a NaN
-	process (pred, fpsr)
-		variable n, z, nan : std_logic;
-		variable t : std_logic;
-	begin
-		n := fpsr(27); z := fpsr(26); nan := fpsr(24);
-		case pred(3 downto 0) is
-			when "0000" => t := '0';
-			when "0001" => t := z;
-			when "0010" => t := not (nan or z or n);
-			when "0011" => t := z or not (nan or n);
-			when "0100" => t := n and not (nan or z);
-			when "0101" => t := z or (n and not nan);
-			when "0110" => t := not (nan or z);
-			when "0111" => t := not nan;
-			when "1000" => t := nan;
-			when "1001" => t := nan or z;
-			when "1010" => t := nan or not (n or z);
-			when "1011" => t := nan or z or not n;
-			when "1100" => t := nan or (n and not z);
-			when "1101" => t := nan or z or n;
-			when "1110" => t := not z;
-			when others => t := '1';
-		end case;
-		pred_true <= t;
-	end process;
+	pred_true <= pred_eval(pred, fpsr(27), fpsr(26), fpsr(24));
 
 	-- the bus cycle of the sequencer
 	bus_act <= '1' when state = ST_XFER else '0';
@@ -260,7 +265,9 @@ begin
 	bus_uds_n <= '1' when xbyte = '1' and xa(0) = '1' else '0';
 	bus_lds_n <= '1' when xbyte = '1' and xa(0) = '0' else '0';
 	bus_wdata <= buf(xi) & buf(xi) when xbyte = '1' else buf(xi) & buf(xi + 1);
-	rd_idx <= 8 + to_integer(unsigned(reg)) when mode /= "000" else to_integer(unsigned(reg));
+	-- the An of the effective address, or Dn (also the counter of FDBcc)
+	rd_idx <= to_integer(unsigned(reg)) when mode = "000" or (opc(8 downto 6) = "001" and mode = "001") else
+			  8 + to_integer(unsigned(reg));
 
 	process (clk)
 		variable e : std_logic_vector(5 downto 0);
@@ -291,6 +298,7 @@ begin
 				wr_en <= '0';
 				case state is
 				when IDLE =>
+					br_r <= '0';
 					if start = '1' then
 						opc <= opcode;
 						cw <= cmd;
@@ -310,6 +318,8 @@ begin
 					-- operand size in memory
 					if opc(8 downto 6) = "100" or opc(8 downto 6) = "101" then
 						nb := 4;								-- FSAVE, FRESTORE header
+					elsif opc(8 downto 6) = "001" then
+						nb := 1;								-- FScc byte (FDBcc: none)
 					elsif cls = "100" or cls = "101" then
 						nb := 4 * popcount3(cw(12 downto 10));	-- control registers
 					elsif cls = "110" or cls = "111" then
@@ -325,6 +335,9 @@ begin
 				-- the operand address, and the register update of (An)+ and -(An)
 				when ST_EA =>
 					nb := nbytes;
+					if opc(8 downto 6) = "001" and mode = "001" then
+						nb := 0;									-- FDBcc
+					end if;
 					case mode is
 						when "010" => addr <= unsigned(areg);
 						when "011" =>
@@ -344,7 +357,47 @@ begin
 				-- dispatch on the instruction
 				when ST_SRC =>
 					null_state <= '0';
-					if opc(8 downto 6) = "100" then
+					if opc(8 downto 6) = "001" then
+						-- FScc and FDBcc: the predicate is in the extension word; a
+						-- signaling predicate on a NaN sets BSUN (and AEXC IOP)
+						null_state <= null_state;
+						if cw(4) = '1' and fpsr(24) = '1' then
+							fpsr(15) <= '1';
+							fpsr(7) <= '1';
+						end if;
+						if pred_eval(cw(5 downto 0), fpsr(27), fpsr(26), fpsr(24)) = '1' then
+							buf(0) <= x"FF";
+						else
+							buf(0) <= x"00";
+						end if;
+						if mode = "001" then
+							-- FDBcc: when false, Dn.w - 1, and branch unless it is -1
+							if pred_eval(cw(5 downto 0), fpsr(27), fpsr(26), fpsr(24)) = '1' then
+								done_r <= '1'; state <= ST_FINISH;
+							else
+								wr_en <= '1'; wr_idx <= to_integer(unsigned(reg)); wr_size <= "01";
+								wr_data <= std_logic_vector(unsigned(rd_data) - 1);
+								if rd_data(15 downto 0) = x"0000" then
+									done_r <= '1'; state <= ST_FINISH;
+								else
+									-- the displacement word, relative to its own address
+									xa <= addr; xi <= 0; xn <= 2; xwr <= '0';
+									state <= ST_XFER; ret_state <= ST_DBCC;
+								end if;
+							end if;
+						elsif mode = "000" then
+							wr_en <= '1'; wr_idx <= to_integer(unsigned(reg)); wr_size <= "00";
+							if pred_eval(cw(5 downto 0), fpsr(27), fpsr(26), fpsr(24)) = '1' then
+								wr_data <= x"000000FF";
+							else
+								wr_data <= x"00000000";
+							end if;
+							done_r <= '1'; state <= ST_FINISH;
+						else
+							xa <= addr; xi <= 0; xn <= 1; xwr <= '1';
+							state <= ST_XFER; ret_state <= ST_FINISH;
+						end if;
+					elsif opc(8 downto 6) = "100" then
 						-- FSAVE: a null frame until a non-conditional instruction ran,
 						-- an idle frame after (68040 UM 9.8)
 						if null_state = '1' then
@@ -660,6 +713,12 @@ begin
 					end if;
 					li <= li + 1;
 					state <= ST_MOVEM;
+
+				when ST_DBCC =>
+					br_r <= '1';
+					brt <= addr + unsigned(resize(signed(std_logic_vector'(buf(0) & buf(1))), 32));
+					done_r <= '1';
+					state <= ST_FINISH;
 
 				when ST_RESTORE =>
 					-- FRESTORE: a null frame resets the FPU; other frames are skipped
