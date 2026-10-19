@@ -132,6 +132,14 @@ entity TG68KdotC_Kernel is
 		busstate					: out std_logic_vector(1 downto 0);	-- 00-> fetch code 10->read data 11->write data 01->no memaccess
 		longword					: out std_logic;
 		newpc						: out std_logic;	-- the PC is about to be loaded (MinimigAGA's prefetch)
+		-- 32-bit data bus (optional): long_req asks for an aligned long data
+		-- access in one bus cycle, the memory answers long_ack in that cycle
+		-- with the high word on data_in_hi (reads) or takes data_write_hi
+		-- with data_write (writes); with long_ack at '0' nothing changes
+		long_req					: out std_logic;
+		long_ack					: in std_logic := '0';
+		data_in_hi				: in std_logic_vector(15 downto 0) := (others => '0');
+		data_write_hi			: out std_logic_vector(15 downto 0);
 		nResetOut				: out std_logic;
 		FC							: out std_logic_vector(2 downto 0);
 		clr_berr					: out std_logic;
@@ -418,6 +426,7 @@ architecture logic of TG68KdotC_Kernel is
 	signal acc_ccr				: std_logic_vector(7 downto 0);
 	signal acc_lw2				: std_logic := '0';		-- the first word of a long access is done
 	signal rf_shadow			: regfile_t;
+	signal long_req_i, long_fast	: std_logic;
 	-- A7 after an RTE format error (- 8) or a format $7 frame (+ 52), and
 	-- MOVE16's An + 16, worked out a state earlier so that the register file
 	-- inputs take registers and no adder
@@ -563,7 +572,18 @@ ALU: TG68K_ALU
 	-- AMR - let the parent module know this is a longword access.  (Easy way to enable burst writes.)
 	longword <= not memmaskmux(3);
 	
-	long_start_alu <= to_bit(NOT memmaskmux(3));
+	-- a long data access that can be done in one bus cycle: the first word
+	-- of a long (memmaskmux(3) clear, not a 3-word bit field access), aligned
+	-- to 4 bytes, by the core itself, and not a MOVEM or a sequence that steps
+	-- the address word by word (mem_addsub), whose next address assumes two
+	-- word cycles
+	long_req_i <= '1' WHEN state(1)='1' AND memmaskmux(3)='0' AND memmaskmux(1)='1' AND addr(1 downto 0)="00" AND
+	                       fpu_bus_act='0' AND m16_active='0' AND exec(movem_action)='0' AND exec(mem_addsub)='0' AND
+	                       mmu_stall='0' AND mmu_bact='0' AND mmu_quiet='0' ELSE '0';	-- (only a cycle of the core on the bus)
+	long_req <= long_req_i;
+	long_fast <= long_req_i AND long_ack;
+	-- the ALU then sees the cycle as the second word (+4 for (An)+ and -(An))
+	long_start_alu <= to_bit(NOT memmaskmux(3) AND NOT long_fast);
 	execOPC_ALU <= execOPC OR exec(alu_exec);
 	process (memmaskmux)
 	begin
@@ -673,7 +693,7 @@ ALU: TG68K_ALU
 			END IF;
 		END IF;
 	END PROCESS;
-	clkena_lw <= '1' WHEN clkena_core='1' AND (memmaskmux(3)='1' OR xc_now='1') ELSE '0';
+	clkena_lw <= '1' WHEN clkena_core='1' AND (memmaskmux(3)='1' OR xc_now='1' OR long_fast='1') ELSE '0';
 	clr_berr <= '1' WHEN setopcode='1' AND trap_berr='1' ELSE '0';
 	
 	PROCESS (clk, nReset)
@@ -696,7 +716,7 @@ ALU: TG68K_ALU
 		END IF;
 	END PROCESS;
 			
-PROCESS (clk, long_done, last_data_in, data_in, addr, long_start, memmaskmux, memread, memmask, data_read)
+PROCESS (clk, long_done, last_data_in, data_in, addr, long_start, memmaskmux, memread, memmask, data_read, long_fast, data_in_hi)
 	BEGIN
 		IF memmaskmux(4)='0' THEN
 			data_read <= last_data_in(15 downto 0)&data_in;
@@ -706,6 +726,9 @@ PROCESS (clk, long_done, last_data_in, data_in, addr, long_start, memmaskmux, me
 		IF memread(0)='1' OR (memread(1 downto 0)="10" AND memmaskmux(4)='1')THEN
 			data_read(31 downto 16) <= (OTHERS=>data_read(15));
 		END IF;	
+		IF long_fast='1' THEN
+			data_read <= data_in_hi & data_in;		-- the whole long at once
+		END IF;
 		
 		IF rising_edge(clk) THEN	
 			IF clkena_lw='1' AND state="10" THEN
@@ -722,11 +745,16 @@ PROCESS (clk, long_done, last_data_in, data_in, addr, long_start, memmaskmux, me
 					last_data_read <= data_read;
 					IF state(1)='0' AND memmask(1)='0' THEN
 						last_data_read(31 downto 16) <= last_opc_read;
-					ELSIF state(1)='0' OR memread(1)='1' THEN
+					ELSIF (state(1)='0' OR memread(1)='1') AND long_fast='0' THEN
+						-- (a long in one cycle is not a word: memread has not advanced)
 						last_data_read(31 downto 16) <= (OTHERS=>data_in(15));
 					END IF;
 				END IF;
-				last_data_in <= last_data_in(15 downto 0)&data_in(15 downto 0);
+				IF long_fast='1' THEN
+					last_data_in <= data_in_hi & data_in;
+				ELSE
+					last_data_in <= last_data_in(15 downto 0)&data_in(15 downto 0);
+				END IF;
 				
 			END IF;
 		END IF;
@@ -734,7 +762,7 @@ PROCESS (clk, long_done, last_data_in, data_in, addr, long_start, memmaskmux, me
 				long_done <= to_bit(NOT memread(1));
 	END PROCESS;
 	
-PROCESS (long_start, reg_QB, data_write_tmp, exec, data_read, data_write_mux, memmaskmux, bf_ext_out, 
+PROCESS (long_start, reg_QB, data_write_tmp, exec, data_read, data_write_mux, memmaskmux, bf_ext_out, long_fast, 
 		 data_write_muxin, memmask, oddout, addr)
 	BEGIN
 		IF exec(write_reg)='1' THEN
@@ -759,7 +787,7 @@ PROCESS (long_start, reg_QB, data_write_tmp, exec, data_read, data_write_mux, me
 		
 		IF memmaskmux(1)='0' THEN
 			data_write_core <= data_write_mux(47 downto 32);
-		ELSIF memmaskmux(3)='0' THEN	
+		ELSIF memmaskmux(3)='0' AND long_fast='0' THEN	
 			data_write_core <= data_write_mux(31 downto 16);
 		ELSE
 -- a single byte shows up on both bus halfs
@@ -964,14 +992,14 @@ PROCESS (opcode, movem_presub, movem_regaddr, source_lowbits, source_areg, sndOP
 -----------------------------------------------------------------------------
 -- set OP1out
 -----------------------------------------------------------------------------
-PROCESS (reg_QA, store_in_tmp, ea_data, long_start, addr, exec, memmaskmux)
+PROCESS (reg_QA, store_in_tmp, ea_data, long_start, addr, exec, memmaskmux, long_fast)
 	BEGIN
 		OP1out <= reg_QA;
 		IF exec(OP1out_zero)='1' THEN
 			OP1out <= (OTHERS => '0');	
 		ELSIF exec(ea_data_OP1)='1' AND store_in_tmp='1' THEN
 			OP1out <= ea_data;
-		ELSIF exec(movem_action)='1' OR memmaskmux(3)='0' OR exec(OP1addr)='1' THEN 
+		ELSIF exec(movem_action)='1' OR (memmaskmux(3)='0' AND long_fast='0') OR exec(OP1addr)='1' THEN 
 			OP1out <= addr;
 		END IF;
 	END PROCESS;
@@ -1264,7 +1292,7 @@ PROCESS (clk, setdisp, memaddr_a, briefdata, memaddr_delta, setdispbyte, datatyp
 				END IF;
 				use_base <= '0'; 
 				memaddr_delta_regb <= (others => '0');
-				IF memmaskmux(3)='0' OR exec(mem_addsub)='1' THEN
+				IF (memmaskmux(3)='0' AND long_fast='0') OR exec(mem_addsub)='1' THEN
 					memaddr_delta_rega <= addsub_q;
 				ELSIF set(restore_ADDR)='1' THEN
 					memaddr_delta_rega <= tmp_TG68_PC;
@@ -5321,6 +5349,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
   -- 68040 mode bit 0 is DE or IE, and CINV or CPUSH of any cache raises bit 3
   -- until the next instruction is decoded.
   CACR_out <= cinv040 & "00" & (CACR040(1) OR CACR040(0)) WHEN cpu040='1' ELSE CACR;
+  data_write_hi <= data_write_mux(31 downto 16);		-- the high word of a long in one cycle
   VBR_out <= VBR;
   process (clk)
   begin
