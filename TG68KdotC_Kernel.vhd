@@ -3299,7 +3299,9 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 					ELSIF opcode(8)='1' AND SVmode='0' THEN
 						trap_priv <= '1';						-- FSAVE, FRESTORE
 						trapmake <= '1';
-					ELSIF decodeOPC='1' AND fpu_gen='1' AND opcode(6)='0' AND fpu_unimpl='1' THEN
+					ELSIF decodeOPC='1' AND fpu_gen='1' AND ((opcode(6)='0' AND fpu_unimpl='1') OR
+					      (opcode(6)='1' AND data_read(15 downto 5)/="00000000000")) THEN
+						-- (FScc/FDBcc: the condition word holds only a predicate 0-31)
 						trap_1111 <= '1';						-- left to the M68040FPSP
 						trapmake <= '1';
 					ELSE
@@ -4316,11 +4318,38 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
   -- decode; what the 68040 does not do in hardware takes Line-F there
   -- (M68040 User's Manual table 9-10, packed decimal, FMOVECR, dynamic
   -- FMOVEM lists, which this unit does not do either)
-  process (data_read)
+  process (data_read, opcode)
 	variable c : std_logic_vector(15 downto 0);
+	variable m : std_logic_vector(2 downto 0);
+	variable r : std_logic_vector(2 downto 0);
+	variable src, single : boolean;
   begin
 	c := data_read(15 downto 0);
+	m := opcode(5 downto 3);
+	r := opcode(2 downto 0);
 	fpu_unimpl <= '0';
+	-- effective address modes the instruction does not allow (PRM section 5)
+	src := c(15 downto 13) = "010" or c(15 downto 13) = "100" or c(15 downto 13) = "110";
+	single := c(12 downto 10) = "100" or c(12 downto 10) = "010" or c(12 downto 10) = "001";
+	if c(15 downto 13) /= "000" then
+	  if m = "001" and not ((c(15 downto 13) = "100" or c(15 downto 13) = "101") and c(12 downto 10) = "001") then
+		fpu_unimpl <= '1';					-- An: only a single FPIAR
+	  elsif m = "000" and (c(15 downto 13) = "110" or c(15 downto 13) = "111" or
+						   ((c(15 downto 13) = "100" or c(15 downto 13) = "101") and not single) or
+						   ((c(15 downto 13) = "010" or c(15 downto 13) = "011") and
+							(c(12 downto 10) = "010" or c(12 downto 10) = "011" or c(12 downto 10) = "101" or
+							 c(12 downto 10) = "111"))) then
+		fpu_unimpl <= '1';					-- Dn: B W L S, or one control register
+	  elsif m = "111" and (r(2 downto 1) = "11" or r = "101") then
+		fpu_unimpl <= '1';
+	  elsif m = "111" and (r = "100" or r = "010" or r = "011") and not src then
+		fpu_unimpl <= '1';					-- #imm and PC-relative: sources only
+	  elsif c(15 downto 13) = "111" and m = "011" then
+		fpu_unimpl <= '1';					-- FMOVEM to memory: no (An)+
+	  elsif c(15 downto 13) = "110" and m = "100" then
+		fpu_unimpl <= '1';					-- FMOVEM from memory: no -(An)
+	  end if;
+	end if;
 	case c(15 downto 13) is
 	  when "000" | "010" =>
 		case c(6 downto 0) is
