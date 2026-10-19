@@ -1159,7 +1159,9 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 						trap_trace <= '0';
 						TG68_PC_word <= '0';
 						trap_berr <= '0';
-					ELSIF opcode(7 downto 0)="00000000" OR opcode(7 downto 0)="11111111" OR data_is_source='1' THEN
+					-- a displacement byte of $FF selects the 32-bit form only on the
+					-- 68020 and later; on the 68000 and 68010 it is -1 (PRM, Bcc)
+					ELSIF opcode(7 downto 0)="00000000" OR (opcode(7 downto 0)="11111111" AND cpu(1)='1') OR data_is_source='1' THEN
 						TG68_PC_word <= '1';
 					END IF;	
 					
@@ -2752,7 +2754,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 					IF opcode(11 downto 8)="0001" THEN		--bsr
 						set(presub) <= '1';
 						setstackaddr <='1';
-						IF opcode(7 downto 0)="11111111" THEN
+						IF opcode(7 downto 0)="11111111" AND cpu(1)='1' THEN
 							next_micro_state <= bsr2;
 							set(longaktion) <= '1';
 						ELSIF opcode(7 downto 0)="00000000" THEN
@@ -2763,7 +2765,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 							writePC <= '1';
 						END IF;
 					ELSE									--bra
-						IF opcode(7 downto 0)="11111111" THEN
+						IF opcode(7 downto 0)="11111111" AND cpu(1)='1' THEN
 							next_micro_state <= bra1;
 							set(longaktion) <= '1';
 						ELSIF opcode(7 downto 0)="00000000" THEN
