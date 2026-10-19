@@ -382,6 +382,21 @@ architecture logic of TG68KdotC_Kernel is
 	signal m16_inc_x, m16_inc_y : std_logic;
 	signal m16_rx, m16_ry	: integer range 8 to 15;
 	signal addr_out_core	: std_logic_vector(31 downto 0);
+	-- 68040 MMU (TG68K_MMU) between the core and the bus
+	signal clkena_core		: std_logic;
+	signal TC040E				: std_logic := '0';
+	signal bus_l				: std_logic_vector(1 downto 0);	-- the core's access, logical
+	signal addr_l				: std_logic_vector(31 downto 0);
+	signal nwr_l, nuds_l, nlds_l : std_logic;
+	signal dwr_l				: std_logic_vector(15 downto 0);
+	signal mmu_act, mmu_stall, mmu_quiet, mmu_fault, mmu_fault_pend : std_logic;
+	signal mmu_fc				: std_logic_vector(2 downto 0);
+	signal mmu_paddr, mmu_baddr, mmu_mmusr : std_logic_vector(31 downto 0);
+	signal mmu_bact, mmu_bwr	: std_logic;
+	signal mmu_bwdata			: std_logic_vector(15 downto 0);
+	signal mmu_ptest, mmu_ptest_done, mmu_pflush, mmu_pflush_all : std_logic;
+	signal mmu_wr, mmu_ptest_wr	: std_logic;
+	signal mmu_ptest_addr		: std_logic_vector(31 downto 0);
 	-- 68040 FPU (TG68K_FPU): the kernel decodes, builds the effective address
 	-- of the modes it shares with the integer unit and waits in fpu_wait
 	signal fpu_ins				: std_logic;	-- cpGEN, FSAVE or FRESTORE of the FPU
@@ -492,25 +507,69 @@ ALU: TG68K_ALU
 	cpu010 <= cpu(0) OR cpu(1);
 	cpu040 <= cpu(1) AND NOT cpu(0);
 
-	nWr <= NOT fpu_bus_wr WHEN fpu_bus_act='1' ELSE
+	nwr_l <= NOT fpu_bus_wr WHEN fpu_bus_act='1' ELSE
 	       '0' WHEN m16_active='1' AND m16_step(3)='1' ELSE
 	       '1' WHEN m16_active='1' ELSE
 	       '0' WHEN state="11" ELSE '1';
-	busstate <= "11" WHEN fpu_bus_act='1' AND fpu_bus_wr='1' ELSE
+	bus_l <= "11" WHEN fpu_bus_act='1' AND fpu_bus_wr='1' ELSE
 	            "10" WHEN fpu_bus_act='1' ELSE
 	            "11" WHEN m16_active='1' AND m16_step(3)='1' ELSE
 	            "10" WHEN m16_active='1' ELSE state;
-	addr_out <= fpu_bus_addr WHEN fpu_bus_act='1' ELSE m16_addr WHEN m16_active='1' ELSE addr_out_core;
-	data_write <= fpu_bus_wdata WHEN fpu_bus_act='1' ELSE
+	addr_l <= fpu_bus_addr WHEN fpu_bus_act='1' ELSE m16_addr WHEN m16_active='1' ELSE addr_out_core;
+	dwr_l <= fpu_bus_wdata WHEN fpu_bus_act='1' ELSE
 	              m16_buf(conv_integer(m16_step(2 downto 0))) WHEN m16_active='1' AND m16_step(3)='1' ELSE data_write_core;
 	nResetOut <= '0' WHEN exec(opcRESET)='1' ELSE '1';
 	
 	-- does shift for byte access. note active low me
 	-- should produce address error on 68000
 	memmaskmux <= memmask when addr(0) = '1' else memmask(4 downto 0) & '1';
-	nUDS <= fpu_uds_n WHEN fpu_bus_act='1' ELSE '0' WHEN m16_active='1' ELSE memmaskmux(5);
-	nLDS <= fpu_lds_n WHEN fpu_bus_act='1' ELSE '0' WHEN m16_active='1' ELSE memmaskmux(4);
-	clkena_lw <= '1' WHEN clkena_in='1' AND memmaskmux(3)='1' ELSE '0';
+	nuds_l <= fpu_uds_n WHEN fpu_bus_act='1' ELSE '0' WHEN m16_active='1' ELSE memmaskmux(5);
+	nlds_l <= fpu_lds_n WHEN fpu_bus_act='1' ELSE '0' WHEN m16_active='1' ELSE memmaskmux(4);
+
+	-- through the MMU: table search cycles, a held or quiet access, or the
+	-- access at its physical address
+	clkena_core <= clkena_in AND NOT mmu_stall;
+	mmu_act <= '1' WHEN bus_l/="01" AND cpu040='1' ELSE '0';
+	mmu_fc <= SVmode & "10" WHEN bus_l="00" ELSE SVmode & "01";
+	busstate <= "11" WHEN mmu_bact='1' AND mmu_bwr='1' ELSE
+	            "10" WHEN mmu_bact='1' ELSE
+	            "01" WHEN mmu_stall='1' OR mmu_quiet='1' ELSE bus_l;
+	nWr <= NOT mmu_bwr WHEN mmu_bact='1' ELSE '1' WHEN mmu_stall='1' OR mmu_quiet='1' ELSE nwr_l;
+	nUDS <= '0' WHEN mmu_bact='1' ELSE '1' WHEN mmu_stall='1' OR mmu_quiet='1' ELSE nuds_l;
+	nLDS <= '0' WHEN mmu_bact='1' ELSE '1' WHEN mmu_stall='1' OR mmu_quiet='1' ELSE nlds_l;
+	addr_out <= mmu_baddr WHEN mmu_bact='1' ELSE mmu_paddr WHEN cpu040='1' ELSE addr_l;
+	data_write <= mmu_bwdata WHEN mmu_bact='1' ELSE dwr_l;
+
+	mmu : entity work.TG68K_MMU
+		port map (clk => clk, reset => Reset, clkena => clkena_in, tc_e => TC040E, tc_p => TC040,
+				  urp => URP, srp => SRP, itt0 => ITT0, itt1 => ITT1, dtt0 => DTT0, dtt1 => DTT1,
+				  act => mmu_act, laddr => addr_l, wr => mmu_wr, fc => mmu_fc, paddr => mmu_paddr,
+				  stall => mmu_stall, quiet => mmu_quiet, fault => mmu_fault,
+				  bus_act => mmu_bact, bus_addr => mmu_baddr, bus_wr => mmu_bwr, bus_wdata => mmu_bwdata,
+				  data_in => data_in, ptest => mmu_ptest, ptest_addr => mmu_ptest_addr,
+				  ptest_fc => DFC, ptest_wr => mmu_ptest_wr, ptest_done => mmu_ptest_done, mmusr => mmu_mmusr,
+				  pflush => mmu_pflush, pflush_all => mmu_pflush_all);
+	mmu_wr <= NOT nwr_l;
+	mmu_ptest_addr <= regfile(8 + conv_integer(opcode(2 downto 0)));
+	mmu_ptest_wr <= NOT opcode(5);		-- PTESTW
+	mmu_ptest <= '1' WHEN micro_state=mmu_ptest1 ELSE '0';
+	mmu_pflush <= '1' WHEN cpu040='1' AND decodeOPC='1' AND SVmode='1' AND opcode(15 downto 5)="11110101000" ELSE '0';
+	mmu_pflush_all <= opcode(3);		-- PFLUSHA, PFLUSH (An); PFLUSHAN and PFLUSHN keep global entries
+
+	-- a translation fault is reported as a bus error at the end of the instruction
+	process (clk)
+	begin
+		IF rising_edge(clk) THEN
+			IF Reset='1' THEN
+				mmu_fault_pend <= '0';
+			ELSIF mmu_fault='1' AND clkena_in='1' THEN
+				mmu_fault_pend <= '1';
+			ELSIF trap_berr='1' THEN
+				mmu_fault_pend <= '0';
+			END IF;
+		END IF;
+	END PROCESS;
+	clkena_lw <= '1' WHEN clkena_core='1' AND memmaskmux(3)='1' ELSE '0';
 	clr_berr <= '1' WHEN setopcode='1' AND trap_berr='1' ELSE '0';
 	
 	PROCESS (clk, nReset)
@@ -519,7 +578,7 @@ ALU: TG68K_ALU
 			syncReset <= "0000";
 			Reset <= '1'; 
 	  	ELSIF rising_edge(clk) THEN
-			IF clkena_in='1' THEN
+			IF clkena_core='1' THEN
 				syncReset <= syncReset(2 downto 0)&'1';
 				Reset <= NOT syncReset(3);	
 			END IF;
@@ -554,7 +613,7 @@ PROCESS (clk, long_done, last_data_in, data_in, addr, long_start, memmaskmux, me
 			END IF;	
 			IF Reset='1' THEN
 				last_data_read <= (OTHERS => '0');
-			ELSIF clkena_in='1' THEN
+			ELSIF clkena_core='1' THEN
 				IF state="00" OR exec(update_ld)='1' THEN 
 					last_data_read <= data_read;
 					IF state(1)='0' AND memmask(1)='0' THEN
@@ -1018,7 +1077,7 @@ PROCESS (clk, setdisp, memaddr_a, briefdata, memaddr_delta, setdispbyte, datatyp
 		END IF;	 
 		
 		IF rising_edge(clk) THEN
-			IF clkena_in='1' THEN
+			IF clkena_core='1' THEN
 				IF exec(get_2ndOPC)='1' OR (state="10" AND memread(0)='1') THEN
 					tmp_TG68_PC <= addr;
 				END IF;
@@ -1160,7 +1219,7 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 				exec_write_back <= '0';
 			ELSE
 --				IPL_nr <= NOT IPL;
-				IF clkena_in='1' THEN
+				IF clkena_core='1' THEN
 					memmask <= memmask(3 downto 0)&"11";
 					memread <= memread(1 downto 0)&memmaskmux(5 downto 4);
 --					IF wbmemmask(5 downto 4)="11" THEN	
@@ -1191,7 +1250,7 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 					exe_opcode <= opcode;
 
 					if(trap_berr='0') then
-						make_berr <= (berr OR make_berr);
+						make_berr <= (berr OR mmu_fault_pend OR make_berr);
 					else
 						make_berr <= '0';
 					end if;
@@ -1539,7 +1598,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		 SVmode, preSVmode, stop, long_done, ea_only, setstate, addrvalue, execOPC, exec_write_back, exe_datatype,
 		 datatype, interrupt, c_out, trapmake, rot_cnt, brief, addr, trap_trapv, last_data_in, use_VBR_Stackframe,
 		 long_start, set_datatype, sndOPC, set_exec, exec, ea_build_now, reg_QA, reg_QB, make_berr, trap_berr,
-		 cpu040, m16_done, fpu_ins, fpu_gen, fpu_memea, fpu_fbcc, fpu_unimpl, fpu_done)
+		 cpu040, m16_done, fpu_ins, fpu_gen, fpu_memea, fpu_fbcc, fpu_unimpl, fpu_done, mmu_ptest_done)
 	BEGIN
 		TG68_PC_brw <= '0';	
 		setstate <= "00";
@@ -3282,6 +3341,9 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 					IF SVmode='0' THEN
 						trap_priv <= '1';
 						trapmake <= '1';
+					ELSIF decodeOPC='1' AND opcode(6)='1' THEN
+						setstate <= "01";
+						next_micro_state <= mmu_ptest1;		-- PTEST (An)
 					END IF;
 				ELSIF cpu040='1' AND (opcode(11 downto 3)="011000100" OR opcode(11 downto 5)="0110000") THEN	--MOVE16
 					-- (Ax)+,(Ay)+ has its extension word in sndOPC after the
@@ -4028,6 +4090,16 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 					setstackaddr <= '1';
 					set(Regwrena) <= '1';
 					
+				WHEN mmu_ptest1 =>	-- PTEST: the MMU starts on this edge
+					setstate <= "01";
+					next_micro_state <= mmu_ptest2;
+				WHEN mmu_ptest2 =>
+					setstate <= "01";
+					IF mmu_ptest_done='1' THEN
+						next_micro_state <= fpu_end;
+					ELSE
+						next_micro_state <= mmu_ptest2;
+					END IF;
 				WHEN fpu_go =>		-- FPU: TG68K_FPU starts on this edge
 					setstate <= "01";
 					next_micro_state <= fpu_wait;
@@ -4339,7 +4411,8 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 	end case;
 	fpu_ext <= n;
   end process;
-  fpu_next_pc <= exe_pc + 4 + fpu_ext WHEN fpu_gen='1' ELSE exe_pc + 2 + fpu_ext;
+  fpu_next_pc <= exe_pc + 2 WHEN opcode(15 downto 8)=X"F5" ELSE			-- PTEST
+                 exe_pc + 4 + fpu_ext WHEN fpu_gen='1' ELSE exe_pc + 2 + fpu_ext;
   fpu_target <= fpu_br_target WHEN fpu_br='1' ELSE fpu_next_pc;
 
   fpu : entity work.TG68K_FPU
@@ -4420,7 +4493,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 -----------------------------------------------------------------------------
 -- MOVEC
 -----------------------------------------------------------------------------
-  process (clk, SFC, DFC, VBR, CACR, brief, cpu040, CACR040, TC040, ITT0, ITT1, DTT0, DTT1, MMUSR, URP, SRP)
+  process (clk, SFC, DFC, VBR, CACR, brief, cpu040, CACR040, TC040, TC040E, ITT0, ITT1, DTT0, DTT1, MMUSR, URP, SRP)
   begin
 	-- all other hexa codes should give illegal isntruction exception
 	if rising_edge(clk) then
@@ -4432,8 +4505,11 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		CACR040 <= "00";
 		ITT0(15) <= '0';
 		ITT1(15) <= '0';
+		TC040E <= '0';
 		DTT0(15) <= '0';
 		DTT1(15) <= '0';
+	  elsif clkena_lw = '1' and mmu_ptest_done = '1' then
+		MMUSR <= mmu_mmusr;
 	  elsif clkena_lw = '1' and exec(movec_wr) = '1' then
 		case brief(11 downto 0) is
 		  when X"000" => SFC <= reg_QA(2 downto 0); -- SFC -- 68010+
@@ -4444,9 +4520,8 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 			else
 			  CACR <= reg_QA(3 downto 0); -- 68020+
 			end if;
-		  -- 68040 MMU registers (68040 UM 3.1): unimplemented bits read as 0;
-		  -- TC E stays clear, since the core has no MMU (Emu68 does the same)
-		  when X"003" => TC040 <= reg_QA(14);
+		  -- 68040 MMU registers (68040 UM 3.1): unimplemented bits read as 0
+		  when X"003" => TC040 <= reg_QA(14); TC040E <= reg_QA(15);
 		  when X"004" => ITT0 <= reg_QA and X"FFFFE364";
 		  when X"005" => ITT1 <= reg_QA and X"FFFFE364";
 		  when X"006" => DTT0 <= reg_QA and X"FFFFE364";
@@ -4474,7 +4549,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		else
 		  movec_data <= "0000000000000000000000000000" & (CACR AND "0011");
 		end if;
-	  when X"003" => movec_data <= X"0000" & '0' & TC040 & "00000000000000";
+	  when X"003" => movec_data <= X"0000" & TC040E & TC040 & "00000000000000";
 	  when X"004" => movec_data <= ITT0;
 	  when X"005" => movec_data <= ITT1;
 	  when X"006" => movec_data <= DTT0;
