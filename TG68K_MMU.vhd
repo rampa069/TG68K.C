@@ -15,13 +15,15 @@
 -- the bus (bus_*), and the access goes on once the entry is in the cache.
 -- A fault (invalid descriptor, write or supervisor violation) sets fault
 -- and lets the access through untranslated without a bus cycle (quiet);
--- the kernel takes it as a bus error at the end of the instruction, since
--- TG68K.C cannot restart an instruction (no format $7 frame).
+-- the kernel takes it as an access error (format $7 frame).
 --
 -- PTEST searches the tables for ptest_addr with the function code in
 -- ptest_fc, loads the cache and returns the MMU status register value;
--- PFLUSH variants flush the cache (pflush_all: all entries, else the
--- non-global ones).
+-- PFLUSH variants flush the cache (UM 3.7.2): pflush_all keeps no global
+-- entry (PFLUSHA, PFLUSH (An)), else the global ones stay (PFLUSHAN,
+-- PFLUSHN (An)); pflush_page limits it to the entries of the page of
+-- pflush_addr with the S bit pflush_s (DFC), as PFLUSH (An) and PFLUSHN
+-- (An) do.
 --
 -- Copyright (c) 2026 Ramon Martinez. LGPL-3.0-or-later, as TG68K.C.
 ------------------------------------------------------------------------------
@@ -61,7 +63,10 @@ entity TG68K_MMU is
 		ptest_done : out std_logic;
 		mmusr      : out std_logic_vector(31 downto 0);
 		pflush     : in  std_logic;
-		pflush_all : in  std_logic
+		pflush_all : in  std_logic;
+		pflush_page : in std_logic := '0';
+		pflush_addr : in std_logic_vector(31 downto 0) := (others => '0');
+		pflush_s   : in  std_logic := '0'
 	);
 end entity;
 
@@ -181,7 +186,9 @@ begin
 				done_r <= '0';
 				if pflush = '1' then
 					for i in 0 to N - 1 loop
-						if pflush_all = '1' or e_g(i) = '0' then
+						if (pflush_all = '1' or e_g(i) = '0') and
+						   (pflush_page = '0' or (e_lp(i) = unsigned(page_of(pflush_addr, tc_p)) and
+						                         e_super(i) = pflush_s)) then
 							e_valid(i) <= '0';
 						end if;
 					end loop;

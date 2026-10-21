@@ -117,7 +117,10 @@ entity TG68KdotC_Kernel is
 		MUL_Hardware : integer := 1;		--0=>no,			1=>yes,  
 		-- 1 keeps the MiSTer Minimig data cache switch, bit 8 of the 68020 CACR
 		-- (the 68030 ED bit), readable and driving D_CACHE_out
-		D_Cache_Bit : integer := 0
+		D_Cache_Bit : integer := 0;
+		-- 68040 FPU: 1 as the MC68040, leaving to the M68040FPSP what it leaves
+		-- (OVFL, UNFL, denormalized operands...); 0 completes it all in hardware
+		FPU_FPSP : integer := 1
 		);
 	port(clk						: in std_logic;
 		nReset					: in std_logic;			--low active
@@ -303,6 +306,17 @@ architecture logic of TG68KdotC_Kernel is
 	signal trap_1111			: bit;
 	signal trap_fmt			: bit;					-- RTE with a frame format it cannot restore
 	signal trap_unsupp		: bit;					-- FP unsupported data type, vector 55
+	-- FP arithmetic exception, vectors 48-54 (testbed-9bf.16): from the FPU
+	-- (fpu_trapx; post-instruction with format $3 when fpu_xpost), or at
+	-- the decode of an FBcc with one pending or a BSUN to take (fpu_fbx);
+	-- fpu_tx marks the entry of a pre-instruction one (format $0, the PC of
+	-- the instruction)
+	signal trap_fpx			: bit;
+	signal fpu_xexc, fpu_xpost, fpu_xpend, fpu_nan, fpu_bsun_en, fpu_set_bsun : std_logic;
+	signal fpu_xvec, fpu_xpvec, fpx_v : std_logic_vector(2 downto 0);
+	signal fpu_trapx, fpu_fbx	: std_logic;
+	signal fpu_xhere			: std_logic;
+	signal fpu_tx				: std_logic := '0';
 	signal fpu_unsupp, fpu_upost : std_logic;
 	signal fpu_trap55			: std_logic;
 	signal fpu_tu				: std_logic := '0';		-- its exception entry
@@ -324,6 +338,15 @@ architecture logic of TG68KdotC_Kernel is
 	signal trap_vector		: std_logic_vector(31 downto 0);
 	signal trap_vector_vbr	: std_logic_vector(31 downto 0);
 	signal USP					: std_logic_vector(31 downto 0);
+	-- 68020 and later: the supervisor stack pointer SR.M does not select, the
+	-- MSP when M is 0 and the ISP when M is 1 (the one it selects is A7 in
+	-- supervisor mode, USP above in user mode, which then holds it)
+	signal OSP					: std_logic_vector(31 downto 0);
+	signal preMmode			: std_logic;	-- the M that A7/USP and OSP stand for
+	signal set_chgM			: bit;			-- swap them: SR.M changed
+	signal exec_chgM			: bit;
+	signal chgM_S				: std_logic;	-- with S before the swap
+	signal thr_pass			: bit;			-- interrupt with M set: the throwaway frame on the ISP
 --	signal illegal_write_mode	: bit;
 --	signal illegal_read_mode	: bit;
 --	signal illegal_byteaddr		: bit;
@@ -437,6 +460,27 @@ architecture logic of TG68KdotC_Kernel is
 	signal acc_srh				: std_logic_vector(7 downto 0);
 	signal acc_ccr				: std_logic_vector(7 downto 0);
 	signal acc_lw2				: std_logic := '0';		-- the first word of a long access is done
+	-- a faulting data write is held as a pending write-back, as on the 68040
+	-- (UM 8.4.6, table 8-6, write page fault): acc_wdefer says the write may be
+	-- (one write of an instruction that writes once), acc_wpend that one is
+	-- held: the instruction completes with its later writes suppressed, and
+	-- the exception is taken at the decode of the next one, with that one's
+	-- address as PC and the write in WB2 (acc_wb2*); RTE goes on after it
+	signal acc_wdefer, acc_wpend	: std_logic := '0';
+	signal acc_wb					: std_logic := '0';		-- WB2 valid in the frame
+	signal acc_m16w				: std_logic := '0';		-- a MOVE16 write fault: PD0-PD3
+	signal acc_wb2s				: std_logic_vector(7 downto 0);
+	-- a physical bus error (TEA on berr, 68040 mode): an access error with
+	-- ATC clear; a write is held in WB1, memory aligned (UM table 8-6, normal
+	-- write physical bus error)
+	signal acc_tea, acc_wb1		: std_logic := '0';
+	signal acc_wb1s				: std_logic_vector(7 downto 0);
+	signal acc_wb1d				: std_logic_vector(31 downto 0);
+	-- MOVEM: CM in the SSW and the effective address in the frame (UM 8.4.6.2)
+	signal acc_cm					: std_logic := '0';
+	signal acc_ea, movem_ea		: std_logic_vector(31 downto 0);
+	signal movem_first			: std_logic := '0';
+	signal acc_wb2a, acc_wb2d	: std_logic_vector(31 downto 0);
 	signal rf_shadow			: regfile_t;
 	signal long_spec, long_req_i, long_fast	: std_logic;
 	-- A7 after an RTE format error (- 8) or a format $7 frame (+ 52), and
@@ -482,6 +526,7 @@ architecture logic of TG68KdotC_Kernel is
 	signal nwr_l, nuds_l, nlds_l : std_logic;
 	signal dwr_l				: std_logic_vector(15 downto 0);
 	signal mmu_act, mmu_stall, mmu_quiet, mmu_fault, mmu_fault_pend : std_logic;
+	signal mmu_pflush_page		: std_logic;
 	signal mmu_fc				: std_logic_vector(2 downto 0);
 	signal fc_int				: std_logic_vector(2 downto 0);
 	signal mmu_paddr, mmu_baddr, mmu_mmusr : std_logic_vector(31 downto 0);
@@ -644,14 +689,27 @@ ALU: TG68K_ALU
 	-- an MMU fault on an access of the core or the FPU (not MOVE16, not during
 	-- exception processing: a fault there is not reported)
 	-- (nor while a fetch fault is pending)
-	acc_now <= '1' WHEN cpu040='1' AND mmu_quiet='1' AND m16_active='0' AND ae_frame='0' AND acc_frame='0' AND
-	                    acc_fpend='0' ELSE '0';
-	acc_go <= '1' WHEN acc_fpend='1' AND decodeOPC='1' ELSE '0';
+	acc_tea <= '1' WHEN cpu040='1' AND berr='1' AND mmu_bact='0' AND bus_l/="01" ELSE '0';
+	acc_now <= '1' WHEN cpu040='1' AND (mmu_quiet='1' OR acc_tea='1') AND ae_frame='0' AND acc_frame='0' AND
+	                    acc_fpend='0' AND acc_wpend='0' ELSE '0';
+	-- a write that is held instead of restarting the instruction: not MOVEM,
+	-- MOVEP or a bit field (more than one write), not TAS or CAS/CAS2 (locked),
+	-- not the FPU or MOVE16, not exception processing
+	acc_wdefer <= '1' WHEN state="11" AND fpu_bus_act='0' AND m16_active='0' AND
+	                       opcode(15 downto 7)/="010010001" AND
+	                       NOT (opcode(15 downto 12)="0000" AND opcode(8)='1' AND opcode(5 downto 3)="001") AND
+	                       NOT (opcode(15 downto 11)="11101" AND opcode(7 downto 6)="11") AND
+	                       opcode(15 downto 6)/="0100101011" AND
+	                       NOT (opcode(15 downto 11)="00001" AND opcode(10 downto 9)/="00" AND opcode(8 downto 6)="011") AND
+	                       micro_state/=trap00 AND micro_state/=trap0 AND micro_state/=trap1 AND micro_state/=trap2 AND
+	                       micro_state/=trap4 AND micro_state/=trap5 AND micro_state/=trap6 AND
+	                       micro_state/=ae_push AND interrupt='0' ELSE '0';
+	acc_go <= '1' WHEN (acc_fpend='1' OR acc_wpend='1') AND decodeOPC='1' ELSE '0';
 	acc_late <= '1' WHEN acc_fpend='1' AND decodeOPC='0' AND interrupt='0' ELSE '0';
-	acc_restart <= '1' WHEN (acc_now='1' AND state/="00") OR acc_late='1' ELSE '0';
+	acc_restart <= '1' WHEN (acc_now='1' AND state/="00" AND acc_wdefer='0') OR acc_late='1' ELSE '0';
 	xc_now <= ae_now OR acc_restart OR acc_go;
 
-	nwr_l <= '1' WHEN ae_now='1' OR acc_fpend='1' ELSE
+	nwr_l <= '1' WHEN ae_now='1' OR acc_fpend='1' OR (acc_wpend='1' AND state="11") ELSE
 	       NOT fpu_bus_wr WHEN fpu_bus_act='1' ELSE
 	       '0' WHEN m16_active='1' AND m16_step(3)='1' ELSE
 	       '1' WHEN m16_active='1' ELSE
@@ -660,7 +718,7 @@ ALU: TG68K_ALU
 	            "10" WHEN fpu_bus_act='1' ELSE
 	            "11" WHEN m16_active='1' AND m16_step(3)='1' ELSE
 	            "10" WHEN m16_active='1' ELSE
-	            "01" WHEN ae_now='1' OR acc_fpend='1' ELSE state;
+	            "01" WHEN ae_now='1' OR acc_fpend='1' OR (acc_wpend='1' AND state="11") ELSE state;
 	addr_l <= fpu_bus_addr WHEN fpu_bus_act='1' ELSE m16_addr WHEN m16_active='1' ELSE addr_out_core;
 	dwr_l <= fpu_bus_wdata WHEN fpu_bus_act='1' ELSE
 	              m16_buf(conv_integer(m16_step(2 downto 0))) WHEN m16_active='1' AND m16_step(3)='1' ELSE data_write_core;
@@ -669,8 +727,8 @@ ALU: TG68K_ALU
 	-- does shift for byte access. note active low me
 	-- should produce address error on 68000
 	memmaskmux <= memmask when addr(0) = '1' else memmask(4 downto 0) & '1';
-	nuds_l <= fpu_uds_n WHEN fpu_bus_act='1' ELSE '0' WHEN m16_active='1' ELSE '1' WHEN ae_now='1' OR acc_fpend='1' ELSE memmaskmux(5);
-	nlds_l <= fpu_lds_n WHEN fpu_bus_act='1' ELSE '0' WHEN m16_active='1' ELSE '1' WHEN ae_now='1' OR acc_fpend='1' ELSE memmaskmux(4);
+	nuds_l <= fpu_uds_n WHEN fpu_bus_act='1' ELSE '0' WHEN m16_active='1' ELSE '1' WHEN ae_now='1' OR acc_fpend='1' OR (acc_wpend='1' AND state="11") ELSE memmaskmux(5);
+	nlds_l <= fpu_lds_n WHEN fpu_bus_act='1' ELSE '0' WHEN m16_active='1' ELSE '1' WHEN ae_now='1' OR acc_fpend='1' OR (acc_wpend='1' AND state="11") ELSE memmaskmux(4);
 
 	-- through the MMU: table search cycles, a held or quiet access, or the
 	-- access at its physical address
@@ -697,13 +755,16 @@ ALU: TG68K_ALU
 				  bus_act => mmu_bact, bus_addr => mmu_baddr, bus_wr => mmu_bwr, bus_wdata => mmu_bwdata,
 				  data_in => data_in, ptest => mmu_ptest, ptest_addr => mmu_ptest_addr,
 				  ptest_fc => DFC, ptest_wr => mmu_ptest_wr, ptest_done => mmu_ptest_done, mmusr => mmu_mmusr,
-				  pflush => mmu_pflush, pflush_all => mmu_pflush_all);
+				  pflush => mmu_pflush, pflush_all => mmu_pflush_all, pflush_page => mmu_pflush_page,
+				  pflush_addr => mmu_ptest_addr, pflush_s => DFC(2));
 	mmu_wr <= NOT nwr_l;
 	mmu_ptest_addr <= regfile(8 + conv_integer(opcode(2 downto 0)));
 	mmu_ptest_wr <= NOT opcode(5);		-- PTESTW
 	mmu_ptest <= '1' WHEN micro_state=mmu_ptest1 ELSE '0';
-	mmu_pflush <= '1' WHEN cpu040='1' AND decodeOPC='1' AND SVmode='1' AND opcode(15 downto 5)="11110101000" ELSE '0';
+	-- a state after the decode, once the write of a MOVEC to DFC before it has landed
+	mmu_pflush <= '1' WHEN micro_state=pflush1 ELSE '0';
 	mmu_pflush_all <= opcode(3);		-- PFLUSHA, PFLUSH (An); PFLUSHAN and PFLUSHN keep global entries
+	mmu_pflush_page <= NOT opcode(4);	-- PFLUSH (An), PFLUSHN (An): the page of An, S from DFC
 
 	-- a translation fault is reported as a bus error at the end of the instruction
 	process (clk)
@@ -711,8 +772,8 @@ ALU: TG68K_ALU
 		IF rising_edge(clk) THEN
 			IF Reset='1' THEN
 				mmu_fault_pend <= '0';
-			ELSIF mmu_fault='1' AND clkena_in='1' AND (m16_active='1' OR cpu040='0') THEN
-				mmu_fault_pend <= '1';		-- MOVE16: a bus error at the end
+			ELSIF mmu_fault='1' AND clkena_in='1' AND cpu040='0' THEN
+				mmu_fault_pend <= '1';
 			ELSIF trap_berr='1' THEN
 				mmu_fault_pend <= '0';
 			END IF;
@@ -839,7 +900,7 @@ PROCESS (long_start, reg_QB, data_write_tmp, exec, data_read, data_write_mux, me
 -- Registerfile
 -----------------------------------------------------------------------------
 PROCESS (clk, regfile, RDindex_A, RDindex_B, exec, m16_last, m16_inc_x, m16_inc_y, m16_rx, m16_ry, ae_fix_r, ae_fix_idx_r, ae_fix_val_r, micro_state,
-		 fpu_wr_en, fpu_wr_size, fpu_wr_idx, fpu_wr_data)
+		 fpu_wr_en, fpu_wr_size, fpu_wr_idx, fpu_wr_data, exec_chgM, chgM_S, OSP, USP, brief, preMmode)
 	BEGIN
 		reg_QA <= regfile(RDindex_A);
 		reg_QB <= regfile(RDindex_B);
@@ -884,6 +945,27 @@ PROCESS (clk, regfile, RDindex_A, RDindex_B, exec, m16_last, m16_inc_x, m16_inc_
 				IF exec(to_USP)='1' THEN
 					USP <= reg_QA;
 				END IF;	
+				-- SR.M changed: in supervisor mode A7 and OSP are swapped, in user
+				-- mode USP and OSP; with S changing too, the M swap comes first, in
+				-- the old mode, and changeMode then swaps A7 and USP
+				IF exec_chgM='1' THEN
+					IF chgM_S='1' THEN
+						OSP <= reg_QA;
+					ELSE
+						OSP <= USP;
+					END IF;
+					IF chgM_S=to_stdulogic(exec(changeMode)) THEN
+						USP <= OSP;
+					END IF;
+				END IF;
+				-- MOVEC to the MSP or the ISP: A7 when M selects it, else OSP
+				IF exec(movec_wr)='1' AND (brief(11 downto 0)=X"803" OR brief(11 downto 0)=X"804") THEN
+					IF brief(0)=preMmode THEN
+						regfile(15) <= reg_QA;
+					ELSE
+						OSP <= reg_QA;
+					END IF;
+				END IF;
 				-- the registers as they were before the instruction: taken on its
 				-- decode edge, with the write-back of the previous instruction
 				-- landing on that edge merged in; an access error puts them back
@@ -908,13 +990,16 @@ PROCESS (clk, regfile, RDindex_A, RDindex_B, exec, m16_last, m16_inc_x, m16_inc_
 -----------------------------------------------------------------------------
 -- Write Reg
 -----------------------------------------------------------------------------
-PROCESS (OP1in, reg_QA, Regwrena_now, Bwrena, Lwrena, exe_datatype, WR_AReg, movem_actiond, exec, ALUout, memaddr, memaddr_a, ea_only, USP, movec_data)
+PROCESS (OP1in, reg_QA, Regwrena_now, Bwrena, Lwrena, exe_datatype, WR_AReg, movem_actiond, exec, ALUout, memaddr, memaddr_a, ea_only, USP, movec_data,
+		 exec_chgM, chgM_S, OSP)
 	BEGIN
 		regin <= ALUout;
 		IF exec(save_memaddr)='1' THEN
 			regin <= memaddr;	
 		ELSIF exec(get_ea_now)='1' AND ea_only='1' THEN
 			regin <= memaddr_a;	
+		ELSIF exec_chgM='1' AND chgM_S/=to_stdulogic(exec(changeMode)) THEN
+			regin <= OSP;		-- the other supervisor stack into A7
 		ELSIF exec(from_USP)='1' THEN
 			regin <= USP;	
 		ELSIF exec(movec_rd)='1' THEN
@@ -931,7 +1016,7 @@ PROCESS (OP1in, reg_QA, Regwrena_now, Bwrena, Lwrena, exe_datatype, WR_AReg, mov
 		Bwrena <= '0';
 		Wwrena <= '0';
 		Lwrena <= '0';
-		IF exec(presub)='1' OR exec(postadd)='1' OR exec(changeMode)='1' THEN		-- -(An)+
+		IF exec(presub)='1' OR exec(postadd)='1' OR exec(changeMode)='1' OR (exec_chgM='1' AND chgM_S='1') THEN		-- -(An)+
 			Wwrena <= '1';
 			Lwrena <= '1';
 		ELSIF Regwrena_now='1' THEN		--dbcc	
@@ -1146,8 +1231,8 @@ PROCESS (clk)
 					END IF;
 				ELSIF writePC='1' THEN
 					data_write_tmp <= TG68_PC;
-				ELSIF (fmt_err='1' OR fpu_lf='1') AND micro_state=trap1 THEN
-					data_write_tmp <= exe_pc;			-- format error: the RTE
+				ELSIF (fmt_err='1' OR fpu_lf='1' OR fpu_tx='1') AND micro_state=trap1 THEN
+					data_write_tmp <= exe_pc;			-- format error: the RTE; FP pre-instruction
 				ELSIF (fpu_tf='1' OR fpu_tfp='1' OR fpu_tu='1') AND micro_state=trap1 THEN
 					data_write_tmp <= fpu_next_pc;		-- unimplemented FP, FTRAPcc: the next instruction
 				ELSIF exec(writePC_add)='1' THEN
@@ -1171,6 +1256,8 @@ PROCESS (clk)
 					ELSIF	useStackframe2='1' THEN
 						-- stack frame format #2
 						data_write_tmp(15 downto 0) <= "0010" & trap_vector(11 downto 0); --TH
+					elsif thr_pass='1' then
+						data_write_tmp(15 downto 0) <= "0001" & trap_vector(11 downto 0);	-- throwaway
 					else
 						data_write_tmp(15 downto 0) <= "0000" & trap_vector(11 downto 0);
 						writePCnext <= trap_trap OR trap_trapv OR exec(trap_chk) OR Z_error;
@@ -1268,6 +1355,9 @@ PROCESS (clk, setdisp, memaddr_a, briefdata, memaddr_delta, setdispbyte, datatyp
 				END IF;	
 				IF trap_fmt='1' THEN
 					trap_vector(9 downto 0) <= "00" & X"38";		-- format error
+				END IF;
+				IF trap_fpx='1' THEN
+					trap_vector(9 downto 0) <= "00" & "110" & fpx_v & "00";		-- 48 + n
 				END IF;
 				IF trap_unsupp='1' THEN
 					trap_vector(9 downto 0) <= "00" & X"DC";		-- FP unsupported data type
@@ -1427,7 +1517,7 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 		IF setstate="00" AND next_micro_state=idle AND setnextpass='0' AND (exec_write_back='0' OR state="11") AND set_rot_cnt="000001" AND set_exec(opcCHK)='0'THEN
 			setendOPC <= '1';
 			-- level 7 passes the mask only on its rising edge (nmi_pending)
-			IF FlagsSR(2 downto 0)<IPL_nr OR (IPL_nr="111" AND nmi_pending='1') OR make_trace='1' OR make_berr='1' THEN
+			IF acc_wpend='0' AND (FlagsSR(2 downto 0)<IPL_nr OR (IPL_nr="111" AND nmi_pending='1') OR make_trace='1' OR make_berr='1') THEN
 				setinterrupt <= '1';
 			ELSIF stop='0' THEN
 				setopcode <= '1';
@@ -1505,7 +1595,7 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 					exe_opcode <= opcode;
 
 					if(trap_berr='0') then
-						make_berr <= (berr OR mmu_fault_pend OR make_berr);
+						make_berr <= ((berr AND NOT cpu040) OR mmu_fault_pend OR make_berr);	-- 68040: TEA
 					else
 						make_berr <= '0';
 					end if;
@@ -1527,7 +1617,7 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 							trap_interrupt <= '1';
 						END IF;
 					END IF;	
-					IF micro_state=trap0 AND IPL_autovector='0' THEN 			
+					IF micro_state=trap0 AND IPL_autovector='0' AND thr_pass='0' THEN 			
 						IPL_vec <= last_data_read(7 downto 0);    --	TH
 					END IF;	
 					IF state="00" THEN				
@@ -1667,6 +1757,9 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 					IF micro_state=rte_ferr THEN
 						trap_SR <= rte_sr;
 					END IF;
+					IF micro_state=thr0 THEN
+						trap_SR(5) <= '1';		-- the throwaway frame's SR has S set
+					END IF;
 				END IF;	
 			END IF;	
 		END IF;	
@@ -1797,7 +1890,17 @@ PROCESS (clk, Reset, FlagsSR, last_data_read, OP2out, exec)
 				preSVmode <= '1';
 				FlagsSR <= "00100111";
 				make_trace <= '0';
+				preMmode <= '0';
+				exec_chgM <= '0';
 			ELSIF clkena_lw = '1' THEN
+				exec_chgM <= set_chgM;
+				chgM_S <= preSVmode;
+				IF set_chgM='1' THEN
+					preMmode <= NOT preMmode;
+				END IF;
+				IF micro_state=thr0 THEN
+					FlagsSR(4) <= '0';		-- interrupt with M set: on to the ISP
+				END IF;
 				IF setopcode='1' THEN
 					make_trace <= FlagsSR(7);
 					IF set(changeMode)='1' THEN
@@ -1889,6 +1992,14 @@ PROCESS (clk)
 	END PROCESS;
 
 -----------------------------------------------------------------------------
+-- SR.M selects the MSP or the ISP (68020 and later): the stack pointers are
+-- swapped where a change of S swaps them, and within exception processing
+-- for an interrupt taken with M set and an RTE of a format $1 frame
+-----------------------------------------------------------------------------
+	set_chgM <= '1' WHEN cpu(1)='1' AND FlagsSR(4)/=preMmode AND (setexecOPC='1' OR micro_state=rte_f1) ELSE
+				'1' WHEN micro_state=thr0 ELSE '0';
+
+-----------------------------------------------------------------------------
 -- decode opcode
 -----------------------------------------------------------------------------
 PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state, decodeOPC, state, setexecOPC, Flags, FlagsSR, direct_data, build_logical,
@@ -1897,7 +2008,8 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		 datatype, interrupt, c_out, trapmake, rot_cnt, brief, addr, trap_trapv, last_data_in, use_VBR_Stackframe,
 		 long_start, set_datatype, sndOPC, set_exec, exec, ea_build_now, reg_QA, reg_QB, make_berr, trap_berr,
 		 cpu040, m16_done, fpu_ins, fpu_gen, fpu_memea, fpu_fbcc, fpu_unimpl, fpu_badcmd, fpu_done, mmu_ptest_done,
-		 fpu_unimp, fpu_trap2, fpu_ftrap, fpu_unsupp, fpu_upost, fpu_trap55)
+		 fpu_unimp, fpu_trap2, fpu_ftrap, fpu_unsupp, fpu_upost, fpu_trap55, set_chgM, thr_pass,
+		 fpu_xexc, fpu_xpost, fpu_trapx, fpu_fbx)
 	BEGIN
 		TG68_PC_brw <= '0';	
 		setstate <= "00";
@@ -1941,6 +2053,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		trap_1111 <='0';
 		trap_fmt <= '0';
 		trap_unsupp <= '0';
+		trap_fpx <= '0';
 		trap_trap <='0';
 		trap_trapv <= '0';
 		trapmake <='0';
@@ -1994,7 +2107,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		IF trapmake='1' AND trapd='0' THEN
 			-- exec(trap_chk) still holds a CHK that did not trap during the decode
 			-- cycle of the next instruction: a CHK only traps outside decode
-			IF cpu(1)='1' AND (trap_trapv='1' OR set_Z_error='1' OR (exec(trap_chk)='1' AND decodeOPC='0') OR fpu_trap2='1' OR (fpu_trap55='1' AND fpu_upost='1')) THEN
+			IF cpu(1)='1' AND (trap_trapv='1' OR set_Z_error='1' OR (exec(trap_chk)='1' AND decodeOPC='0') OR fpu_trap2='1' OR (fpu_trap55='1' AND fpu_upost='1') OR (fpu_trapx='1' AND fpu_xpost='1')) THEN
 				next_micro_state <= trap00;
 			else
 				next_micro_state <= trap0;
@@ -2048,6 +2161,9 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		IF set(changeMode)='1' THEN		
 			set(to_USP) <= '1';
 			set(from_USP) <= '1';
+			setstackaddr <='1';
+		END IF;
+		IF set_chgM='1' THEN
 			setstackaddr <='1';
 		END IF;
 			
@@ -3584,7 +3700,12 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 				-- PFLUSH and PTEST only check the privilege (PTEST leaves MMUSR
 				-- alone); scope 00 of CINV and CPUSH is not an instruction
 				IF cpu040='1' AND opcode(11 downto 9)="001" THEN			--FPU (coprocessor 1)
-					IF fpu_fbcc='1' THEN
+					IF fpu_fbcc='1' AND fpu_fbx='1' THEN
+						-- FBcc with an exception pending, or a signaling predicate on a
+						-- NaN with BSUN enabled: the pre-instruction exception
+						trap_fpx <= '1';
+						trapmake <= '1';
+					ELSIF fpu_fbcc='1' THEN
 						-- FBcc: Bcc.W or Bcc.L with the condition of the FPCC
 						datatype <= "10";
 						IF micro_state=idle THEN
@@ -3642,6 +3763,9 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 					ELSIF decodeOPC='1' AND opcode(6)='1' THEN
 						setstate <= "01";
 						next_micro_state <= mmu_ptest1;		-- PTEST (An)
+					ELSIF decodeOPC='1' AND opcode(5)='0' THEN
+						setstate <= "01";
+						next_micro_state <= pflush1;		-- PFLUSH
 					END IF;
 				ELSIF cpu040='1' AND (opcode(11 downto 3)="011000100" OR opcode(11 downto 5)="0110000") THEN	--MOVE16
 					-- (Ax)+,(Ay)+ has its extension word in sndOPC after the
@@ -3790,8 +3914,14 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		IF rising_edge(clk) THEN
 	        IF Reset='1' THEN
 				micro_state <= ld_nn;
+				thr_pass <= '0';
 			ELSIF clkena_lw='1' THEN
 				trapd <= trapmake;
+				IF micro_state=thr0 THEN
+					thr_pass <= '1';
+				ELSIF micro_state=trap3 THEN
+					thr_pass <= '0';
+				END IF;
 				IF xc_now='1' THEN
 					micro_state <= ae_fix1;		-- address or access error: then the frame
 				ELSE
@@ -4298,9 +4428,16 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 					writeSR <= '1';
 					IF trap_berr='1' OR (ae_frame='1' AND cpu="00") THEN
 						next_micro_state <= trap4;
+					ELSIF trap_interrupt='1' AND FlagsSR(4)='1' AND cpu(1)='1' AND thr_pass='0' THEN
+						next_micro_state <= thr0;
 					ELSE
 						next_micro_state <= trap3;
 					END IF;
+				WHEN thr0 =>		-- interrupt with M set (68020/68040 UM 8.4): the frame
+									-- above went on the MSP; M is cleared, and a format $1
+									-- throwaway frame, the same with S set, goes on the ISP
+					setstate <= "01";
+					next_micro_state <= trap0;
 				WHEN trap3 =>		-- TRAP
 					set_vectoraddr <= '1';
 					datatype <= "10";
@@ -4373,7 +4510,12 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 											-- check for stack frame format #2
 					-- formats the core can restore: $0, $2 (68020 and later) and
 					-- $3 (68040, as long as $2); any other takes the format error
-					if cpu040='1' and last_data_in(15 downto 12)="0111" then
+					if cpu(1)='1' and last_data_in(15 downto 12)="0001" then
+						-- throwaway frame: its SR is loaded, the stack it selects is
+						-- taken and the RTE starts again there
+						setstate <= "01";
+						next_micro_state <= rte_f1;
+					elsif cpu040='1' and last_data_in(15 downto 12)="0111" then
 						-- access error frame: no continuation is pending (the core sets
 						-- no CP, CU, CT or CM), so the rest of the frame is dropped
 						setstate <= "01";
@@ -4404,6 +4546,9 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 					setstackaddr <= '1';
 					set(Regwrena) <= '1';
 					
+				WHEN pflush1 =>		-- PFLUSH: the MMU flushes on this edge
+					setstate <= "01";
+					next_micro_state <= fpu_end;
 				WHEN mmu_ptest1 =>	-- PTEST: the MMU starts on this edge
 					setstate <= "01";
 					next_micro_state <= mmu_ptest2;
@@ -4414,6 +4559,18 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 					ELSE
 						next_micro_state <= mmu_ptest2;
 					END IF;
+				WHEN rte_f1 =>		-- RTE of a format $1 frame: S and M of its SR take effect
+					setstate <= "01";
+					IF FlagsSR(5)/=preSVmode THEN
+						set(changeMode) <= '1';
+					END IF;
+					next_micro_state <= rte_f1b;
+				WHEN rte_f1b =>		-- and the RTE again, on that stack
+					setstate <= "10";
+					set(postadd) <= '1';
+					setstackaddr <= '1';
+					set(directSR) <= '1';
+					next_micro_state <= rte1;
 				WHEN rte_f7 =>		-- RTE of a format $7 frame: A7 + 52 worked out
 					setstate <= "01";
 					next_micro_state <= rte_f7b;
@@ -4463,6 +4620,11 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 						-- unimplemented floating-point instruction: vector 11, format
 						-- $2 (68040 UM 9.6); trapmake chooses trap00 (fpu_trap2)
 						trap_1111 <= '1';
+						trapmake <= '1';
+					ELSIF fpu_done='1' AND fpu_xexc='1' THEN
+						-- arithmetic exception: vectors 48-54, format $0 with the PC of
+						-- the instruction, or $3 for FMOVE out (68040 UM 9.7)
+						trap_fpx <= '1';
 						trapmake <= '1';
 					ELSIF fpu_done='1' AND fpu_unsupp='1' THEN
 						-- unsupported data type (packed decimal): vector 55, format $0
@@ -4720,13 +4882,23 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
   process (clk)
 	variable sz : std_logic_vector(1 downto 0);
 	variable rw : std_logic;
+	variable v : std_logic_vector(31 downto 0);
+	variable n2 : integer range 0 to 7;
   begin
 	if rising_edge(clk) then
 	  if Reset = '1' then
 		acc_frame <= '0';
 		acc_fpend <= '0';
+		acc_wpend <= '0';
 		acc_lw2 <= '0';
 	  elsif clkena_core = '1' then
+		-- the address of MOVEM's first transfer (its EA for the CM frame)
+		if decodeOPC = '1' then
+		  movem_first <= '1';
+		elsif state(1) = '1' and movem_first = '1' then
+		  movem_ea <= addr_l;
+		  movem_first <= '0';
+		end if;
 		if state(1) = '1' and memmaskmux(3) = '0' and clkena_lw = '0' then
 		  acc_lw2 <= '1';
 		elsif clkena_lw = '1' then
@@ -4743,24 +4915,93 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		  else
 			sz := "10";
 		  end if;
-		  acc_ssw <= "0000" & acc_lw2 & "10" & rw & '0' & sz & "00" & mmu_fc;
+		  acc_ssw <= "0000" & (acc_lw2 and not acc_tea) & not acc_tea & '0' & rw & '0' & sz & "00" & mmu_fc;
+		  -- MOVEM: CM, and the address its transfers start at as the EA
+		  acc_cm <= '0';
+		  if opcode(15 downto 11) = "01001" and opcode(9 downto 7) = "001" then
+			acc_ssw(12) <= '1';
+			acc_cm <= '1';
+			if movem_first = '1' then
+			  acc_ea <= addr_l;
+			else
+			  acc_ea <= movem_ea;
+			end if;
+		  end if;
+		  -- WB1: the write as it goes on the bus, memory aligned (table 8-5)
+		  acc_wb1 <= '0';
+		  acc_wb1s <= '1' & sz & "00" & mmu_fc;
+		  case sz is
+			when "01" => v := data_write_muxin(7 downto 0) & x"000000";
+			when "10" => v := data_write_muxin(15 downto 0) & x"0000";
+			when others => v := data_write_muxin;
+		  end case;
+		  if acc_lw2 = '1' then
+			n2 := conv_integer(addr_l(1 downto 0)) + 2;
+		  else
+			n2 := conv_integer(addr_l(1 downto 0));
+		  end if;
+		  case n2 mod 4 is
+			when 1 => acc_wb1d <= v(7 downto 0) & v(31 downto 8);
+			when 2 => acc_wb1d <= v(15 downto 0) & v(31 downto 16);
+			when 3 => acc_wb1d <= v(23 downto 0) & v(31 downto 24);
+			when others => acc_wb1d <= v;
+		  end case;
 		  if acc_lw2 = '1' then
 			acc_fa <= addr_l - 2;
+			acc_wb2a <= addr_l - 2;
 		  else
 			acc_fa <= addr_l;
+			acc_wb2a <= addr_l;
+		  end if;
+		  acc_wb <= '0';
+		  acc_m16w <= '0';
+		  acc_wb2s <= '1' & sz & "00" & mmu_fc;
+		  acc_wb2d <= data_write_muxin;		-- register aligned (table 8-5)
+		  if acc_wdefer = '1' then
+			acc_wpend <= '1';
+			if acc_tea = '1' then
+			  acc_wb1 <= '1';
+			else
+			  acc_wb <= '1';
+			end if;
+		  end if;
+		  if m16_active = '1' then
+			-- MOVE16: the line (SIZE 11, TT 01); the instruction restarts. A
+			-- write fault holds the line in WB2 and PD0-PD3 (table 8-6, write
+			-- page fault with a MOVE16 in WB2); a write bus error in WB1
+			acc_ssw <= "00000" & not acc_tea & '0' & rw & '0' & "11" & "01" & mmu_fc;
+			acc_wb1s <= '1' & "11" & "01" & mmu_fc;
+			acc_wb2s <= '1' & "11" & "01" & mmu_fc;
+			acc_wb2d <= m16_buf(0) & m16_buf(1);
+			if m16_step(3) = '1' then
+			  acc_fa <= m16_dst;
+			  acc_wb2a <= m16_dst;
+			  acc_wb <= not acc_tea;
+			  acc_wb1 <= acc_tea;
+			  acc_m16w <= '1';
+			else
+			  acc_fa <= m16_src;
+			end if;
 		  end if;
 		end if;
 		if acc_now = '1' and state = "00" then
 		  acc_fpend <= '1';				-- a fetch: decided in the next cycle
 		elsif acc_restart = '1' and clkena_lw = '1' then
 		  acc_fpend <= '0';
+		  acc_wpend <= '0';
 		  acc_frame <= '1';
 		  acc_pc <= exe_pc;				-- the instruction restarts
 		  acc_srh <= FlagsSR;
 		elsif acc_go = '1' and clkena_lw = '1' then
 		  acc_fpend <= '0';
+		  acc_wpend <= '0';
 		  acc_frame <= '1';
-		  acc_pc <= acc_fa;				-- the next instruction, at the faulting fetch
+		  if acc_wpend = '1' then
+			acc_pc <= TG68_PC - 2;		-- a held write: the instruction after it,
+										-- the one being decoded
+		  else
+			acc_pc <= acc_fa;			-- the next instruction, at the faulting fetch
+		  end if;
 		  acc_srh <= FlagsSR;
 		elsif acc_fpend = '1' and interrupt = '1' then
 		  acc_fpend <= '0';				-- not used: an interrupt was taken instead
@@ -4779,18 +5020,50 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 -- 68020 format $A frame (MC68020 UM table 6-5) below the format word,
 -- index 0 at SP+8. Internal and reserved words are zero.
 -----------------------------------------------------------------------------
-  process (cpu, ae_cnt, ae_ssw, ae_addr, ae_dob, acc_frame, acc_ssw, acc_fa)
+  process (cpu, ae_cnt, ae_ssw, ae_addr, ae_dob, acc_frame, acc_ssw, acc_fa, acc_wb, acc_wb2s, acc_wb2a, acc_wb2d,
+		   acc_m16w, m16_buf, acc_wb1, acc_wb1s, acc_wb1d, acc_cm, acc_ea)
   begin
 	ae_xword <= (others => '0');
 	if acc_frame = '1' then
 	  -- 68040 format $7 (UM 8.4.6): EA, SSW, WB3S-WB1S, FA, then write-back
-	  -- and push data, all zero (no write-back is pending)
+	  -- and push data; only WB2 can be pending (a held write or a MOVE16
+	  -- write), with the line in PD0-PD3 for a MOVE16
 	  case ae_cnt is
 		when 2 => ae_xword <= acc_ssw;						-- SP+$0C
 		when 6 => ae_xword <= acc_fa(31 downto 16);		-- SP+$14
 		when 7 => ae_xword <= acc_fa(15 downto 0);
 		when others => null;
 	  end case;
+	  if acc_wb = '1' then
+		case ae_cnt is
+		  when 4 => ae_xword <= X"00" & acc_wb2s;			-- SP+$10, WB2S
+		  when 12 => ae_xword <= acc_wb2a(31 downto 16);	-- SP+$20, WB2A
+		  when 13 => ae_xword <= acc_wb2a(15 downto 0);
+		  when 14 => ae_xword <= acc_wb2d(31 downto 16);	-- SP+$24, WB2D
+		  when 15 => ae_xword <= acc_wb2d(15 downto 0);
+		  when others => null;
+		end case;
+	  end if;
+	  if acc_cm = '1' then
+		case ae_cnt is
+		  when 0 => ae_xword <= acc_ea(31 downto 16);		-- SP+$08, EA
+		  when 1 => ae_xword <= acc_ea(15 downto 0);
+		  when others => null;
+		end case;
+	  end if;
+	  if acc_wb1 = '1' then
+		case ae_cnt is
+		  when 5 => ae_xword <= X"00" & acc_wb1s;			-- SP+$12, WB1S
+		  when 16 => ae_xword <= acc_fa(31 downto 16);		-- SP+$28, WB1A = FA
+		  when 17 => ae_xword <= acc_fa(15 downto 0);
+		  when 18 => ae_xword <= acc_wb1d(31 downto 16);	-- SP+$2C, WB1D
+		  when 19 => ae_xword <= acc_wb1d(15 downto 0);
+		  when others => null;
+		end case;
+	  end if;
+	  if acc_m16w = '1' and ae_cnt >= 18 then
+		ae_xword <= m16_buf(ae_cnt - 18);					-- SP+$2C, PD0-PD3
+	  end if;
 	elsif cpu(1) = '1' then
 	  if ae_cnt = 1 then ae_xword <= ae_ssw; end if;		-- SP+$0A
 	else
@@ -5059,6 +5332,10 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
   fpu_bsun <= '1' WHEN micro_state=bra1 AND cpu040='1' AND exe_opcode(15 downto 7)="111100101" ELSE '0';
   fpu_trap2 <= '1' WHEN micro_state=fpu_wait AND fpu_done='1' AND fpu_unimp='1' ELSE '0';
   fpu_trap55 <= '1' WHEN micro_state=fpu_wait AND fpu_done='1' AND fpu_unsupp='1' ELSE '0';
+  fpu_trapx <= '1' WHEN micro_state=fpu_wait AND fpu_done='1' AND fpu_xexc='1' ELSE '0';
+  fpu_fbx <= '1' WHEN micro_state=idle AND (fpu_xpend='1' OR (opcode(4)='1' AND fpu_nan='1' AND fpu_bsun_en='1')) ELSE '0';
+  fpu_set_bsun <= '1' WHEN fpu_fbcc='1' AND fpu_fbx='1' AND fpu_xpend='0' ELSE '0';
+  fpx_v <= fpu_xvec WHEN micro_state=fpu_wait ELSE fpu_xpvec WHEN fpu_xpend='1' ELSE "000";
   -- marks the exception entry of an unimplemented FP instruction
   process (clk)
   begin
@@ -5067,16 +5344,22 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		fpu_tf <= '0';
 		fpu_tfp <= '0';
 		fpu_tu <= '0';
+		fpu_tx <= '0';
 	  elsif clkena_lw = '1' then
 		if fpu_trap2 = '1' then
 		  fpu_tf <= '1';
 		elsif micro_state = trap3 then
 		  fpu_tf <= '0';
 		end if;
-		if fpu_trap55 = '1' then
+		if fpu_trap55 = '1' or (fpu_trapx = '1' and fpu_xpost = '1') then
 		  fpu_tu <= '1';
 		elsif micro_state = trap3 then
 		  fpu_tu <= '0';
+		end if;
+		if trap_fpx = '1' and fpu_tu = '0' and not (fpu_trapx = '1' and fpu_xpost = '1' and fpu_xhere = '0') then
+		  fpu_tx <= '1';
+		elsif micro_state = trap3 then
+		  fpu_tx <= '0';
 		end if;
 		if micro_state = fpu_wait and fpu_done = '1' and fpu_ftrap = '1' then
 		  fpu_tfp <= '1';
@@ -5214,6 +5497,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
   fpu_target <= fpu_br_target WHEN fpu_br='1' ELSE fpu_next_pc;
 
   fpu : entity work.TG68K_FPU
+	generic map (FPSP => FPU_FPSP)
 	port map (clk => clk, reset => Reset, clkena => clkena_lw, start => fpu_start,
 			  opcode => opcode, cmd => sndOPC, ea => fpu_ea, iaddr => exe_pc, done => fpu_done, abort => acc_restart,
 			  unimp => fpu_unimp, unsupp => fpu_unsupp, upost => fpu_upost, ea_out => fpu_ea_out, ftrap => fpu_ftrap, br_take => fpu_br,
@@ -5222,7 +5506,9 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 			  wr_data => fpu_wr_data, wr_size => fpu_wr_size, bus_act => fpu_bus_act,
 			  bus_addr => fpu_bus_addr, bus_wr => fpu_bus_wr, bus_uds_n => fpu_uds_n,
 			  bus_lds_n => fpu_lds_n, bus_wdata => fpu_bus_wdata, data_in => data_in,
-			  pred => fpu_pred, pred_true => fpu_pred_true, pred_bsun => fpu_bsun);
+			  pred => fpu_pred, pred_true => fpu_pred_true, pred_bsun => fpu_bsun,
+			  xexc => fpu_xexc, xvec => fpu_xvec, xpost => fpu_xpost, xhere_o => fpu_xhere, xpend_o => fpu_xpend, xpend_vec => fpu_xpvec,
+			  fpcc_nan => fpu_nan, fp_bsun_en => fpu_bsun_en, set_bsun => fpu_set_bsun);
 
 -----------------------------------------------------------------------------
 -- MOVE16 (68040)
@@ -5255,7 +5541,10 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		if micro_state = m16_abs then
 		  m16_lo <= data_read(15 downto 0);
 		end if;
-		if micro_state = m16_go then
+		if acc_restart = '1' then
+		  m16_active <= '0';			-- an access error: the MOVE16 restarts
+		  m16_done <= '0';
+		elsif micro_state = m16_go then
 		  absaddr := sndOPC & m16_lo;
 		  if opcode(5) = '1' then
 			m16_src <= regfile(m16_rx);
@@ -5292,7 +5581,8 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 -----------------------------------------------------------------------------
 -- MOVEC
 -----------------------------------------------------------------------------
-  process (clk, SFC, DFC, VBR, CACR, CACR_DC, brief, cpu040, CACR040, TC040, TC040E, ITT0, ITT1, DTT0, DTT1, MMUSR, URP, SRP)
+  process (clk, SFC, DFC, VBR, CACR, CACR_DC, brief, cpu040, CACR040, TC040, TC040E, ITT0, ITT1, DTT0, DTT1, MMUSR, URP, SRP,
+		   preMmode, regfile, OSP)
   begin
 	-- all other hexa codes should give illegal isntruction exception
 	if rising_edge(clk) then
@@ -5335,8 +5625,8 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		  when X"800" => NULL; -- USP -- 68010+
 		  when X"801" => VBR <= reg_QA; -- 68010+
 		  when X"802" => NULL; -- CAAR -- 68020+
-		  when X"803" => NULL; -- MSP -- 68020+
-		  when X"804" => NULL; -- isP -- 68020+
+		  when X"803" => NULL; -- MSP -- 68020+ (in the register file process)
+		  when X"804" => NULL; -- ISP -- 68020+
 		  when others => NULL;
 		end case;
 	  end if;
@@ -5364,6 +5654,12 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 	  when X"806" => movec_data <= URP;
 	  when X"807" => movec_data <= SRP;
 
+	  when X"803" | X"804" =>		-- MSP, ISP: A7 when M selects it, else OSP
+		if brief(0) = preMmode then
+		  movec_data <= regfile(15);
+		else
+		  movec_data <= OSP;
+		end if;
 	  when X"801" => 
 		movec_data <= VBR;
 		--end if;

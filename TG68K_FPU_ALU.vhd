@@ -24,6 +24,10 @@
 -- One operation at a time: start with op, rounding mode and precision and
 -- the operands (dst is FPn, src the source); done is set for one cycle with
 -- result and the FPSR EXC bits it sets (snan operr ovfl unfl dz inex2).
+-- With done, the intermediate result for the exception state frames
+-- (testbed-9bf.16): ires_* before rounding (sign, unbiased exponent and the
+-- mantissa with guard, round and sticky, as UNFL leaves it in WBTEMP) and
+-- rres_* rounded to the precision with the exponent unbounded (OVFL).
 --
 -- op   0 move   1 abs   2 neg   3 sqrt   4 add   5 sub   6 mul   7 div
 --      8 cmp    9 tst   10 to integer (size in rprec: 0 byte, 1 word,
@@ -57,7 +61,12 @@ entity TG68K_FPU_ALU is
 		busy    : out std_logic;
 		done    : out std_logic;
 		result  : out std_logic_vector(79 downto 0);
-		exc     : out std_logic_vector(5 downto 0)	-- snan operr ovfl unfl dz inex2
+		exc     : out std_logic_vector(5 downto 0);	-- snan operr ovfl unfl dz inex2
+		ires_s  : out std_logic;
+		ires_e  : out signed(17 downto 0);
+		ires_m  : out unsigned(67 downto 0);
+		rres_e  : out signed(17 downto 0);
+		rres_m  : out unsigned(67 downto 0)
 	);
 end entity;
 
@@ -119,6 +128,8 @@ architecture rtl of TG68K_FPU_ALU is
 	signal cnt : integer range 0 to 127;
 
 	signal x_snan, x_operr, x_ovfl, x_unfl, x_dz, x_inex : std_logic;
+	signal pre_e, rnd_e : signed(17 downto 0);
+	signal pre_m, rnd_m : unsigned(67 downto 0);
 	signal res : std_logic_vector(79 downto 0);
 	signal done_r : std_logic;
 
@@ -135,6 +146,11 @@ begin
 	done <= done_r;
 	result <= res;
 	exc <= x_snan & x_operr & x_ovfl & x_unfl & x_dz & x_inex;
+	ires_s <= s_r;
+	ires_e <= pre_e;
+	ires_m <= pre_m;
+	rres_e <= rnd_e;
+	rres_m <= rnd_m;
 
 	process (clk)
 		variable e18 : signed(17 downto 0);
@@ -545,6 +561,8 @@ begin
 						m_r <= '0' & m_r(67 downto 2) & (m_r(1) or m_r(0));
 						e_r <= e_r + 1;
 					elsif m_r(66) = '1' then
+						pre_e <= e_r;
+						pre_m <= m_r;
 						if e_r >= emin then
 							state <= RND;		-- not tiny: no DENORM step
 						else
@@ -615,6 +633,8 @@ begin
 					end if;
 					m_r <= mr;
 					e_r <= er;
+					rnd_m <= mr;
+					rnd_e <= er;
 					if inx = '1' then
 						x_inex <= '1';
 					end if;
@@ -648,13 +668,18 @@ begin
 						if rm = "00" or (rm = "10" and s_r = '1') or (rm = "11" and s_r = '0') then
 							res <= s_r & "111111111111111" & x"0000000000000000";
 						else
-							-- largest number of the precision
+							-- largest number of the precision; FSGLDIV and FSGLMUL give
+							-- the largest extended number (M68040FPSP util.S ovf_fsgl)
 							bexp := emax + BIAS;
+							if sgl = '1' then
+								res <= s_r & std_logic_vector(bexp(14 downto 0)) & x"FFFFFFFFFFFFFFFF";
+							else
 							case pr is
 								when "01" => res <= s_r & std_logic_vector(bexp(14 downto 0)) & x"FFFFFF0000000000";
 								when "10" => res <= s_r & std_logic_vector(bexp(14 downto 0)) & x"FFFFFFFFFFFFF800";
 								when others => res <= s_r & std_logic_vector(bexp(14 downto 0)) & x"FFFFFFFFFFFFFFFF";
 							end case;
+							end if;
 						end if;
 					elsif m_r(66) = '1' then
 						bexp := e_r + BIAS;

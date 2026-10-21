@@ -35,8 +35,31 @@
 -- of a busy frame that the FPSP has left with CU_SAVEPC = $FE and E1 and
 -- E3 clear runs the command word on ETEMP and FPTEMP, as the 68040
 -- completes the instruction (res_func of the FPSP). Immediate data is read
--- like a memory operand at the address the kernel gives. FPCR exception
--- enables are kept but never trap.
+-- like a memory operand at the address the kernel gives.
+--
+-- Floating-point arithmetic exceptions (UM 9.7, testbed-9bf.16). The unit
+-- computes the result the 68040 and the M68040FPSP give together, so it
+-- traps only when an exception the instruction raises is enabled in the
+-- FPCR; it then takes the vector the 68040 would take (OVFL and UNFL are
+-- nonmaskable there, so they come before DZ and INEX) and leaves the state
+-- the FPSP handlers read in a 50-word busy frame (fpsp.h offsets): for
+-- FADD, FSUB, FMUL, FDIV, FSQRT, FSGLDIV and FSGLMUL with OVFL, UNFL or
+-- INEX2 an E3 exception with CMDREG3B and the intermediate result in
+-- WBTEMP (rounded for OVFL; before rounding, with guard, round and sticky,
+-- for UNFL), otherwise E1 with CMDREG1B, the source in ETEMP and the
+-- destination in FPTEMP (for FMOVE, FABS and FNEG with OVFL or UNFL the
+-- intermediate result in both) and the nonmaskable exceptions in NMCEXC.
+-- The destination register is not written for OPERR, OVFL, UNFL and DZ
+-- (the FPSP writes OVFL and UNFL results). The exception is pending: the
+-- next floating-point instruction other than FSAVE and FRESTORE takes it
+-- as a pre-instruction exception (format $0, its own address). FMOVE to
+-- memory or Dn takes it at once as a post-instruction exception (T set,
+-- format $3 with the effective address, 0 for Dn). FSAVE stores and clears
+-- the pending frame; FRESTORE of a busy frame with E1 or E3 set makes it
+-- pending again, with the vector the 68040 derives from NMCEXC and the
+-- FPSR (gen_except of the FPSP). BSUN enabled traps FScc, FDBcc, FTRAPcc
+-- and FBcc before the predicate is used (vector 48), with an E1 busy frame
+-- (Linux's skeleton clears E1 for it).
 --
 -- Copyright (c) 2026 Ramon Martinez. LGPL-3.0-or-later, as TG68K.C.
 ------------------------------------------------------------------------------
@@ -45,6 +68,15 @@ use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
 entity TG68K_FPU is
+	generic (
+		-- 1: as the MC68040, which leaves to the M68040FPSP what it does not
+		-- do in hardware: OVFL and UNFL always trap, so do SNAN and OPERR of
+		-- FMOVE to an integer, and denormalized and unnormalized operands take
+		-- the unsupported data type exception (UM 9.6.2, 9.7). 0: the unit
+		-- completes all of it and traps only for exceptions enabled in the FPCR
+		-- (for software without the FPSP)
+		FPSP : integer := 1
+	);
 	port (
 		clk       : in  std_logic;
 		reset     : in  std_logic;
@@ -83,7 +115,21 @@ entity TG68K_FPU is
 		-- conditional predicates (FBcc, FScc, FDBcc, FTRAPcc)
 		pred      : in  std_logic_vector(5 downto 0);
 		pred_true : out std_logic;
-		pred_bsun : in  std_logic := '0'					-- FBcc evaluated pred: set BSUN on a NaN
+		pred_bsun : in  std_logic := '0';				-- FBcc evaluated pred: set BSUN on a NaN
+		-- arithmetic exceptions: xexc with done takes vector 48 + xvec (0 BSUN,
+		-- 1 INEX, 2 DZ, 3 UNFL, 4 OPERR, 5 OVFL, 6 SNAN), post-instruction with
+		-- a format $3 frame when xpost is set; xpend says one is pending (FBcc
+		-- takes it), fpcc_nan and fp_bsun_en decide a BSUN trap of FBcc, which
+		-- set_bsun records in the FPSR
+		xexc      : out std_logic;
+		xvec      : out std_logic_vector(2 downto 0);
+		xpost     : out std_logic;
+		xhere_o   : out std_logic;					-- with xexc and xpost: the PC is this instruction's
+		xpend_o   : out std_logic;
+		xpend_vec : out std_logic_vector(2 downto 0);
+		fpcc_nan  : out std_logic;
+		fp_bsun_en : out std_logic;
+		set_bsun  : in  std_logic := '0'
 	);
 end entity;
 
@@ -157,6 +203,25 @@ architecture rtl of TG68K_FPU is
 	signal re1, re3 : std_logic;
 	signal ufr : frame_t;
 	signal br_r, ftrap_r : std_logic := '0';
+	-- the pending arithmetic exception and its busy frame (also one FRESTORE
+	-- brought back)
+	signal xf : frame_t;
+	signal xpend : std_logic := '0';
+	signal xraw : std_logic := '0';		-- FSAVE: the data comes from xf
+	-- the 26-word frame (E1 exceptions, as on the 68040): its fields are
+	-- xf(52..99), the end of the busy frame; xro reads one into there
+	signal xsmall : std_logic := '0';
+	signal xro : integer range 0 to 48 := 0;
+	signal ru : std_logic := '0';			-- the U flag of the frame FRESTORE reads
+	signal xvec_r : std_logic_vector(2 downto 0);
+	signal xnow, xpost_r, xst : std_logic := '0';
+	signal ires_s : std_logic;
+	signal xhere : std_logic := '0';		-- a pending E3 reported as a post-instruction
+											-- exception by the FMOVE out of its register
+	signal xe3 : std_logic := '0';			-- the pending exception is an E3 one
+	signal rfun : std_logic := '0';			-- the operation comes from FRESTORE (res_func)
+	signal ires_e, rres_e : signed(17 downto 0);
+	signal ires_m, rres_m : unsigned(67 downto 0);
 	signal brt : unsigned(31 downto 0);
 
 	-- memory formats to extended (an unnormal extended value is fine: the
@@ -285,8 +350,9 @@ architecture rtl of TG68K_FPU is
 		end case;
 	end function;
 
-	-- operand tags of the state frames (fpsp.h of the M68040FPSP): norm $00,
-	-- zero $20, infinity $40, NaN $60, denormal $80, unnormal $A0
+	-- operand tags of the state frames (UM 9.8, STAG and DTAG): norm $00,
+	-- zero $20, infinity $40, NaN $60, an extended denormal or unnormal $80
+	-- ($A0, a single or double denormal, is set where the format is known)
 	function tag_of(x : std_logic_vector(79 downto 0)) return std_logic_vector is
 	begin
 		if x(78 downto 64) = "111111111111111" then
@@ -294,12 +360,18 @@ architecture rtl of TG68K_FPU is
 			return x"60";
 		elsif x(63 downto 0) = x"0000000000000000" then
 			return x"20";
-		elsif x(78 downto 64) = "000000000000000" then
-			return x"80";
 		elsif x(63) = '0' then
-			return x"A0";
+			return x"80";
 		end if;
 		return x"00";
+	end function;
+
+	-- an operand the 68040 does not take in hardware: denormalized or
+	-- unnormalized, not zero (an exponent of 0 with J set is the normalized
+	-- 2^-16383, testbed-9bf.36)
+	function unsup_of(x : std_logic_vector(79 downto 0)) return boolean is
+	begin
+		return x(78 downto 64) /= "111111111111111" and x(63) = '0' and x(62 downto 0) /= (62 downto 0 => '0');
 	end function;
 
 	-- the arithmetic unit operation of a command word, bit 4 set when the
@@ -323,6 +395,70 @@ architecture rtl of TG68K_FPU is
 		end case;
 	end function;
 
+	-- the vector of the highest priority exception in m (snan operr ovfl unfl
+	-- dz inex), INEX when none
+	function xvec_of(m : std_logic_vector(5 downto 0)) return std_logic_vector is
+	begin
+		if m(5) = '1' then return "110";
+		elsif m(4) = '1' then return "100";
+		elsif m(3) = '1' then return "101";
+		elsif m(2) = '1' then return "011";
+		elsif m(1) = '1' then return "010";
+		end if;
+		return "001";
+	end function;
+
+	-- CMDREG3B from a CMDREG1B command word (UM figure 9-11, as gen_except
+	-- of the FPSP builds it): the destination register, bit 6, then bit 2,
+	-- bits 5-3 and bits 1-0 of the operation
+	function cmd3b_of(c : std_logic_vector(15 downto 0)) return std_logic_vector is
+	begin
+		return "000000" & c(9 downto 7) & c(6) & c(2) & c(5 downto 3) & c(1 downto 0);
+	end function;
+
+	-- an extended value from the unit's intermediate result: sign, the low
+	-- 15 bits of the biased exponent (UNFL leaves it negative, which the FPSP
+	-- sign-extends from bit 14) and the 64-bit mantissa
+	function ires_x(sg : std_logic; e : signed(17 downto 0); m : unsigned(67 downto 0)) return std_logic_vector is
+		variable b : signed(17 downto 0);
+	begin
+		b := e + 16383;
+		return sg & std_logic_vector(b(14 downto 0)) & std_logic_vector(m(66 downto 3));
+	end function;
+
+	-- an operand the FPSP hands back for res_func: a 15-bit exponent with its
+	-- bit 15 apart (ETE15 in STAG, FPTE15 in DTAG, set by mk_norm for an
+	-- exponent up to $3FFF), so a normalized denormal, whose biased exponent
+	-- is negative, comes as $4000-$7FFF with that bit set: e - $8000. It goes
+	-- to the arithmetic unit as the extended denormal of the same value.
+	function frame_x(x : std_logic_vector(79 downto 0); e15 : std_logic) return std_logic_vector is
+		variable n : integer range 0 to 16384;
+		variable m : unsigned(63 downto 0);
+	begin
+		if e15 = '1' and x(78) = '1' then
+			n := 32768 - to_integer(unsigned(x(78 downto 64)));		-- the shift, -e
+			if n > 63 then
+				m := (others => '0');
+			else
+				m := shift_right(unsigned(x(63 downto 0)), n);
+			end if;
+			return x(79) & "000000000000000" & std_logic_vector(m);
+		end if;
+		return x;
+	end function;
+
+	-- the busy frame of a BSUN exception: E1, the instruction address
+	function bsun_frame(ia : std_logic_vector(31 downto 0)) return frame_t is
+		variable f : frame_t;
+	begin
+		f := (others => x"00");
+		f(0) := x"41"; f(1) := x"60";
+		f(40) := ia(31 downto 24); f(41) := ia(23 downto 16);
+		f(42) := ia(15 downto 8); f(43) := ia(7 downto 0);
+		f(72) := x"04";
+		return f;
+	end function;
+
 	function buf_long(b : bytes_t; i : integer) return std_logic_vector is
 	begin
 		return b(i) & b(i + 1) & b(i + 2) & b(i + 3);
@@ -334,7 +470,15 @@ begin
 	unimp <= unimp_r;
 	unsupp <= unsupp_r;
 	upost <= upost_r;
-	ea_out <= std_logic_vector(addr);
+	ea_out <= (others => '0') when xpost_r = '1' and mode = "000" else std_logic_vector(addr);
+	xexc <= xnow;
+	xvec <= xvec_r;
+	xpost <= xpost_r;
+	xpend_o <= xpend;
+	xhere_o <= xhere;
+	xpend_vec <= xvec_r;
+	fpcc_nan <= fpsr(24);
+	fp_bsun_en <= fpcr(15);
 
 	-- the 26-word unimplemented instruction frame and the 50-word busy
 	-- frame (68040 UM figure 9-10). The FPSP addresses the fields from the
@@ -358,7 +502,7 @@ begin
 		f(o + 16) := cmd1b(15 downto 8); f(o + 17) := cmd1b(7 downto 0);	-- CMDREG1B
 		f(o + 20) := dtag;						-- DTAG
 		f(o + 24) := "00000" & fe1 & "00";		-- E1
-		f(o + 25) := "000" & ft & "0000";		-- T
+		f(o + 25) := "001" & ft & "0000";		-- U (an unimplemented or unsupported frame), T
 		f(o + 28) := fptemp(79 downto 72); f(o + 29) := fptemp(71 downto 64);
 		for i in 0 to 7 loop
 			f(o + 32 + i) := fptemp(63 - 8 * i downto 56 - 8 * i);
@@ -377,7 +521,8 @@ begin
 	alu : entity work.TG68K_FPU_ALU
 		port map (clk => clk, reset => reset, ena => clkena, start => alu_start, op => alu_op, rmode => alu_rm,
 				  rprec => alu_rp, to_mem => alu_tomem, dst => alu_dst, src => alu_src,
-				  busy => alu_busy, done => alu_done, result => alu_res, exc => alu_exc);
+				  busy => alu_busy, done => alu_done, result => alu_res, exc => alu_exc,
+				  ires_s => ires_s, ires_e => ires_e, ires_m => ires_m, rres_e => rres_e, rres_m => rres_m);
 
 	pred_true <= pred_eval(pred, fpsr(27), fpsr(26), fpsr(24));
 
@@ -388,9 +533,19 @@ begin
 	xbyte <= '1' when xa(0) = '1' or xn - xi = 1 else '0';
 	bus_uds_n <= '1' when xbyte = '1' and xa(0) = '1' else '0';
 	bus_lds_n <= '1' when xbyte = '1' and xa(0) = '0' else '0';
-	process (xframe, xbyte, xi, ufr, buf)
+	process (xframe, xraw, xsmall, xbyte, xi, ufr, buf, xf)
 	begin
-		if xframe = '1' and xi < 99 then
+		if xframe = '1' and xraw = '1' and xsmall = '1' then
+			if xi = 0 then
+				bus_wdata <= x"4130";
+			elsif xi < 4 or xi > 51 then
+				bus_wdata <= x"0000";
+			else
+				bus_wdata <= xf(xi + 48) & xf(xi + 49);
+			end if;
+		elsif xframe = '1' and xraw = '1' and xi < 99 then
+			bus_wdata <= xf(xi) & xf(xi + 1);
+		elsif xframe = '1' and xi < 99 then
 			bus_wdata <= ufr(xi) & ufr(xi + 1);
 		elsif xi > 11 then
 			bus_wdata <= (others => '0');		-- not a transfer of buf
@@ -416,6 +571,13 @@ begin
 		variable fpn : integer range 0 to 7;
 		variable idx : integer range 0 to 11;
 		variable isop : boolean;
+		variable hit : std_logic;
+		variable xm : std_logic_vector(5 downto 0);
+		variable f : frame_t;
+		variable c1 : std_logic_vector(15 downto 0);
+		variable ix : std_logic_vector(79 downto 0);
+		variable e3 : boolean;
+		variable lneg : boolean;
 	begin
 		if rising_edge(clk) then
 			if reset = '1' then
@@ -432,10 +594,14 @@ begin
 				busy_pend <= '0';
 				xframe <= '0';
 				xrframe <= '0';
+				xpend <= '0';
+				xraw <= '0';
+				xnow <= '0';
 			elsif clkena = '1' then
 				done_r <= '0';
 				unimp_r <= '0';
 				unsupp_r <= '0';
+				xnow <= '0';
 				alu_start <= '0';
 				wr_en <= '0';
 				if abort = '1' then
@@ -445,15 +611,46 @@ begin
 					xframe <= '0';
 					xrframe <= '0';
 				else
-				if pred_bsun = '1' and pred(4) = '1' and fpsr(24) = '1' then
+				if (pred_bsun = '1' and pred(4) = '1' and fpsr(24) = '1') or set_bsun = '1' then
 					fpsr(15) <= '1';		-- BSUN, and AEXC IOP
 					fpsr(7) <= '1';
+				end if;
+				if set_bsun = '1' then
+					-- FBcc takes BSUN (the kernel traps): the exceptional state
+					xf <= bsun_frame(iaddr);
+					xpend <= '1';
+					xsmall <= '1';
+					xe3 <= '0';
+					xvec_r <= "000";
 				end if;
 				case state is
 				when IDLE =>
 					br_r <= '0';
 					ftrap_r <= '0';
-					if start = '1' then
+					if start = '1' and xpend = '1' and opcode(8 downto 7) /= "10" then
+						-- a pending exception: this instruction takes it first, a
+						-- pre-instruction exception (FSAVE and FRESTORE do not). An
+						-- FMOVE out of the register an E3 exception has to write
+						-- needs that result first, and the 68040 reports it as a
+						-- post-instruction exception, T set and no effective
+						-- address, with this instruction's PC (UM 9.7.4)
+						xpost_r <= '0';
+						xhere <= '0';
+						if FPSP = 1 and xe3 = '1' and opcode(8 downto 6) = "000" and cmd(15 downto 13) = "011" and
+						   cmd(9 downto 7) = xf(52)(1 downto 0) & xf(53)(7) then
+							xpost_r <= '1';
+							xhere <= '1';
+							xf(73)(4) <= '1';
+							mode <= "000";		-- the format $3 frame gets no address
+						end if;
+						xnow <= '1';
+						done_r <= '1';
+						state <= ST_FINISH;
+					elsif start = '1' then
+						xpost_r <= '0';
+						xhere <= '0';
+						xst <= '0';
+						rfun <= '0';
 						opc <= opcode;
 						cw <= cmd;
 						mode <= opcode(5 downto 3);
@@ -475,7 +672,9 @@ begin
 				when ST_REG =>
 					areg <= rd_data;
 					-- operand size in memory
-					if opc(8 downto 6) = "100" and busy_pend = '1' then
+					if opc(8 downto 6) = "100" and xpend = '1' and xsmall = '1' then
+						nb := 52;								-- FSAVE, E1 exception frame
+					elsif opc(8 downto 6) = "100" and (busy_pend = '1' or xpend = '1') then
 						nb := 100;								-- FSAVE, busy frame
 					elsif opc(8 downto 6) = "100" and unimp_pend = '1' then
 						nb := 52;								-- FSAVE, unimplemented frame
@@ -543,7 +742,17 @@ begin
 						else
 							buf(0) <= x"00";
 						end if;
-						if mode = "111" and reg(2 downto 1) /= "00" then
+						if cw(4) = '1' and fpsr(24) = '1' and fpcr(15) = '1' then
+							-- BSUN enabled: the pre-instruction exception, before the
+							-- predicate is used (UM 9.7.1)
+							xvec_r <= "000";
+							xf <= bsun_frame(iaddr);
+							xpend <= '1';
+							xsmall <= '1';
+							xe3 <= '0';
+							xnow <= '1';
+							done_r <= '1'; state <= ST_FINISH;
+						elsif mode = "111" and reg(2 downto 1) /= "00" then
 							-- FTRAPcc: the kernel takes vector 7 when the predicate is true
 							ftrap_r <= pred_eval(cw(5 downto 0), fpsr(27), fpsr(26), fpsr(24));
 							done_r <= '1'; state <= ST_FINISH;
@@ -586,7 +795,12 @@ begin
 						buf(1) <= x"00"; buf(2) <= x"00"; buf(3) <= x"00";
 						xa <= addr; xi <= 0; xn <= 4; xwr <= '1';
 						-- the pending frame is cleared once stored (ST_XFER_DONE)
-						if busy_pend = '1' then
+						if xpend = '1' then
+							xn <= 100;
+							if xsmall = '1' then xn <= 52; end if;
+							xframe <= '1';
+							xraw <= '1';
+						elsif busy_pend = '1' then
 							xn <= 100;
 							xframe <= '1';
 						elsif unimp_pend = '1' then
@@ -629,11 +843,13 @@ begin
 						if not ok then
 							done_r <= '1'; state <= ST_FINISH;
 						else
-							-- precision: the FS and FD forms, else FPCR PREC
+							-- precision: the FS and FD forms, else FPCR PREC, where the
+							-- undefined 11 rounds to double as the M68040FPSP does it
+							-- (round.S ext_grs, add_to_l; util.S denorm)
 							if opm(6) = '1' then
 								if opm(2) = '1' then alu_rp <= "10"; else alu_rp <= "01"; end if;
 							else
-								alu_rp <= fpcr(7 downto 6);
+								alu_rp <= fpcr(7) & (fpcr(6) and not fpcr(7));
 							end if;
 							alu_rm <= fpcr(5 downto 4);
 							alu_tomem <= '0';
@@ -646,7 +862,7 @@ begin
 							fpiar <= iaddr;
 							if cls = "000" then
 								alu_src <= fpr(to_integer(unsigned(cw(12 downto 10))));
-								if isop then
+								if isop and FPSP = 0 then
 									alu_start <= '1';		-- the unit starts now (no ST_ALU)
 									state <= ST_ALU_WAIT;
 								else
@@ -680,6 +896,20 @@ begin
 						alu_tomem <= '1';
 						store <= '1';
 						fpiar <= iaddr;
+						if FPSP = 1 and unsup_of(fpr(fpn)) and fmt /= "011" and fmt /= "111" then
+							-- FMOVE out of a denormalized or unnormalized register: the
+							-- post-instruction unsupported data type exception, nothing
+							-- written (ETEMP and FPTEMP the register, as WinUAE has it)
+							etemp <= fpr(fpn);
+							stag <= tag_of(fpr(fpn));
+							fptemp <= fpr(fpn);
+							dtag <= tag_of(fpr(fpn));
+							cmd1b <= cw;
+							fe1 <= '0'; ft <= '1';
+							busy_pend <= '1'; unimp_pend <= '0';
+							unsupp_r <= '1'; upost_r <= '1';
+							done_r <= '1'; state <= ST_FINISH;
+						else
 						case fmt is
 							when "000" => alu_op <= x"A"; alu_rp <= "10"; state <= ST_ALU;
 							when "100" => alu_op <= x"A"; alu_rp <= "01"; state <= ST_ALU;
@@ -699,18 +929,14 @@ begin
 								unsupp_r <= '1'; upost_r <= '1';
 								done_r <= '1'; state <= ST_FINISH;
 							when "010" =>
-								-- extended: a copy, no rounding
-								x := fpr(fpn);
-								buf(0) <= x(79 downto 72); buf(1) <= x(71 downto 64);
-								buf(2) <= x"00"; buf(3) <= x"00";
-								for i in 0 to 7 loop
-									buf(4 + i) <= x(63 - 8 * i downto 56 - 8 * i);
-								end loop;
-								xa <= addr; xi <= 0; xn <= 12; xwr <= '1';
-								state <= ST_XFER; ret_state <= ST_FINISH;
+								-- extended: through the unit as a move, which keeps the
+								-- value (a denormal as it is, with UNFL, the FPSP's result
+								-- for it) and quiets an SNaN with SNAN set (UM 9.7.2.1)
+								alu_op <= x"0"; alu_rp <= "00"; state <= ST_ALU;
 							when others =>
 								done_r <= '1'; state <= ST_FINISH;
 						end case;
+						end if;
 					elsif cls = "100" then
 						-- FMOVE(M) <ea>,FPCR/FPSR/FPIAR
 						if mode = "000" or mode = "001" then
@@ -774,11 +1000,14 @@ begin
 				-- the last byte
 				when ST_XFER =>
 					if xrframe = '1' then
-						-- FRESTORE of a busy frame: the fields it needs
-						case xi is
+						-- FRESTORE of a busy frame: all of it (an exceptional state
+						-- comes back as it was saved), and the fields it needs
+						xf(xi + xro) <= data_in(15 downto 8);
+						xf(xi + xro + 1) <= data_in(7 downto 0);
+						case xi + xro is
 							when 8 => cusave <= data_in(15 downto 8);
 							when 64 => cmd1b <= data_in;
-							when 72 => re1 <= data_in(10); re3 <= data_in(9);
+							when 72 => re1 <= data_in(10); re3 <= data_in(9); ru <= data_in(5);
 							when 76 => fptemp(79 downto 64) <= data_in;
 							when 80 => fptemp(63 downto 48) <= data_in;
 							when 82 => fptemp(47 downto 32) <= data_in;
@@ -813,9 +1042,11 @@ begin
 					if xframe = '1' then
 						busy_pend <= '0';
 						unimp_pend <= '0';
+						xpend <= '0';
+						xraw <= '0';
 					end if;
 					state <= ret_state;
-					if ret_state = ST_ALU and store = '0' and uop = '0' and pk = '0' then
+					if ret_state = ST_ALU and store = '0' and uop = '0' and pk = '0' and FPSP = 0 then
 						alu_start <= '1';			-- with the converted source below
 						state <= ST_ALU_WAIT;
 					end if;
@@ -832,13 +1063,46 @@ begin
 						end case;
 					elsif ret_state = ST_FINISH then
 						done_r <= '1';
+						xnow <= xst;
 					end if;
 
 				when ST_ALU =>
+					isop := alu_op = x"4" or alu_op = x"5" or alu_op = x"6" or alu_op = x"7" or
+					        alu_op = x"8" or alu_op = x"B" or alu_op = x"C";		-- dyadic
 					if uop = '1' then
 						state <= ST_UNIMP;
 					elsif pk = '1' then
 						state <= ST_UNSUPP;
+					elsif FPSP = 1 and rfun = '0' and
+					      ((unsup_of(alu_src) and (cls = "000" or fmt = "001" or fmt = "101" or fmt = "010")) or
+					       (isop and unsup_of(alu_dst))) then
+						-- (an integer source is converted unnormalized on purpose)
+						-- a denormalized or unnormalized operand: the pre-instruction
+						-- unsupported data type exception (UM 9.6.2), the operands as
+						-- they are in ETEMP and FPTEMP (a single or double denormal in
+						-- the form of figure 9-9, tag $A0)
+						etemp <= alu_src;
+						stag <= tag_of(alu_src);
+						if unsup_of(alu_src) and cls = "010" and (fmt = "001" or fmt = "101") then
+							stag <= x"A0";
+						end if;
+						if isop then
+							fptemp <= alu_dst;
+							dtag <= tag_of(alu_dst);
+						else
+							fptemp <= (others => '0');
+							dtag <= x"00";
+						end if;
+						if cw(6 downto 0) = "0000100" then
+							cmd1b <= cw(15 downto 7) & "0000101";
+						else
+							cmd1b <= cw;
+						end if;
+						fe1 <= '0'; ft <= '0';
+						busy_pend <= '1'; unimp_pend <= '0';
+						unsupp_r <= '1';
+						done_r <= '1';
+						state <= ST_FINISH;
 					else
 						alu_start <= '1';
 						state <= ST_ALU_WAIT;
@@ -859,6 +1123,9 @@ begin
 						etemp <= alu_src;
 						fptemp <= x;
 						stag <= tag_of(alu_src);
+						if unsup_of(alu_src) and cls = "010" and (fmt = "001" or fmt = "101") then
+							stag <= x"A0";			-- a single or double denormal
+						end if;
 						fe1 <= '0';
 					end if;
 					unimp_pend <= '1';
@@ -888,14 +1155,33 @@ begin
 				when ST_ALU_WAIT =>
 					if alu_done = '1' then
 						e := alu_exc;
+						-- FMOVE to an integer of the largest negative integer: an
+						-- operand error on the 68040 (the "erroneous MC68040
+						-- condition" of UM 9.7.3.2), which the FPSP corrects
+						lneg := false;
+						if FPSP = 1 and store = '1' and alu_op = x"A" and alu_src(79) = '1' and e(5) = '0' and e(4) = '0' then
+							case alu_rp is
+								when "00" => lneg := alu_res(7 downto 0) = x"80";
+								when "01" => lneg := alu_res(15 downto 0) = x"8000";
+								when others => lneg := alu_res(31 downto 0) = x"80000000";
+							end case;
+						end if;
 						-- EXC: BSUN SNAN OPERR OVFL UNFL DZ INEX2 INEX1
 						fpsr(15 downto 8) <= '0' & e(5) & e(4) & e(3) & e(2) & e(1) & e(0) & '0';
-						-- AEXC: IOP OVFL UNFL DZ INEX (68040 UM 9.2.3.4)
+						-- AEXC: IOP OVFL UNFL DZ INEX (68040 UM 9.2.3.4); the 68040
+						-- leaves AINEX clear on an overflow (x_ovfl of the FPSP sets it)
 						fpsr(7) <= fpsr(7) or e(5) or e(4);
 						fpsr(6) <= fpsr(6) or e(3);
 						fpsr(5) <= fpsr(5) or (e(2) and e(0));
 						fpsr(4) <= fpsr(4) or e(1);
-						fpsr(3) <= fpsr(3) or e(0) or e(3);
+						if FPSP = 0 or e(3) = '0' then
+							fpsr(3) <= fpsr(3) or e(0) or e(3);
+						end if;
+						-- it traps as an operand error, with no bit in the FPSR (the
+						-- FPSP sets OPERR itself for a true one, x_operr)
+						if lneg then
+							e(4) := '1';
+						end if;
 						if set_cc = '1' then
 							-- condition codes N Z I NAN of the result
 							x := alu_res;
@@ -907,8 +1193,139 @@ begin
 								fpsr(26) <= '1';
 							end if;
 						end if;
-						if wr_fp = '1' then
+						-- an enabled exception (testbed-9bf.16): the busy frame, and
+						-- the destination register kept for OPERR, OVFL, UNFL and DZ;
+						-- FMOVE out writes its destination and traps at once
+						hit := (e(5) and fpcr(14)) or (e(4) and fpcr(13)) or (e(3) and fpcr(12)) or
+						       (e(2) and fpcr(11)) or (e(1) and fpcr(10)) or (e(0) and fpcr(9));
+						if FPSP = 1 then
+							-- the nonmaskable ones: OVFL, UNFL, and SNAN and OPERR of
+							-- FMOVE to an integer
+							hit := hit or e(3) or e(2);
+							if store = '1' and alu_op = x"A" then
+								hit := hit or e(5) or e(4);
+							end if;
+						end if;
+						if wr_fp = '1' and (hit = '0' or (e(4) or e(3) or e(2) or e(1)) = '0') then
 							fpr(to_integer(unsigned(cw(9 downto 7)))) <= alu_res;
+						end if;
+						if hit = '1' then
+							-- the vector the 68040 takes: OVFL and UNFL always, SNAN and
+							-- OPERR always for FMOVE out (UM 9.7.2.2, 9.7.3.2)
+							xm := (e(5) and (fpcr(14) or store)) & (e(4) and (fpcr(13) or store)) & e(3) & e(2) &
+							      (e(1) and fpcr(10)) & (e(0) and fpcr(9));
+							xvec_r <= xvec_of(xm);
+							c1 := cw;
+							if cw(6 downto 0) = "0000100" then
+								c1(6 downto 0) := "0000101";		-- FSQRT (UM 9.8)
+							end if;
+							e3 := store = '0' and e(5) = '0' and e(4) = '0' and e(1) = '0' and
+							      (alu_op = x"3" or alu_op = x"4" or alu_op = x"5" or alu_op = x"6" or
+							       alu_op = x"7" or alu_op = x"B" or alu_op = x"C");
+							f := (others => x"00");
+							f(0) := x"41"; f(1) := x"60";
+							f(40) := fpiar(31 downto 24); f(41) := fpiar(23 downto 16);		-- FPIARCU
+							f(42) := fpiar(15 downto 8); f(43) := fpiar(7 downto 0);
+							f(64) := c1(15 downto 8); f(65) := c1(7 downto 0);				-- CMDREG1B
+							-- ETEMP and FPTEMP: the source (quieted for FMOVE out, as
+							-- WinUAE has it) and the destination of a dyadic operation
+							ix := alu_src;
+							if store = '1' and tag_of(alu_src) = x"60" then
+								ix(62) := '1';
+							end if;
+							f(60) := tag_of(alu_src);
+							f(88) := ix(79 downto 72); f(89) := ix(71 downto 64);
+							for i in 0 to 7 loop
+								f(92 + i) := ix(63 - 8 * i downto 56 - 8 * i);
+							end loop;
+							if store = '0' and (alu_op = x"4" or alu_op = x"5" or alu_op = x"6" or alu_op = x"7" or
+							                    alu_op = x"8" or alu_op = x"B" or alu_op = x"C") then
+								ix := alu_dst;
+								f(68) := tag_of(alu_dst);
+								f(76) := ix(79 downto 72); f(77) := ix(71 downto 64);
+								for i in 0 to 7 loop
+									f(80 + i) := ix(63 - 8 * i downto 56 - 8 * i);
+								end loop;
+							end if;
+							-- the intermediate result: before rounding for UNFL,
+							-- rounded to the precision for OVFL and INEX2
+							if e(2) = '1' then
+								ix := ires_x(ires_s, ires_e, ires_m);
+							else
+								ix := ires_x(ires_s, rres_e, rres_m);
+							end if;
+							if e3 then
+								f(72) := x"02";											-- E3
+								v32 := x"0000" & cmd3b_of(c1);
+								f(52) := v32(15 downto 8); f(53) := v32(7 downto 0);	-- CMDREG3B
+								f(24) := ix(79 downto 72); f(25) := ix(71 downto 64);	-- WBTEMP
+								for i in 0 to 7 loop
+									f(28 + i) := ix(63 - 8 * i downto 56 - 8 * i);
+								end loop;
+								-- guard and round with STAG, sticky; WBTE15 for UNFL
+								f(60)(1) := ires_m(2); f(60)(0) := ires_m(1);
+								f(61)(7) := ires_m(0);
+								if e(2) = '1' then
+									f(69) := x"10";
+								end if;
+								xsmall <= '0';
+								xe3 <= '1';
+							else
+								f(72) := x"04";											-- E1
+								f(57) := "0000" & e(5) & e(4) & e(3) & e(2);			-- NMCEXC
+								-- GRS 1, and for SNAN 7 with WBTE15, also for UNFL of
+								-- FMOVE out (WinUAE's frames, from the hardware)
+								f(61)(7) := '1';
+								if e(5) = '1' then
+									f(60)(1) := '1'; f(60)(0) := '1';
+									f(69) := x"10";
+								elsif store = '1' and e(2) = '1' then
+									f(69) := x"10";
+								end if;
+								xsmall <= '1';
+								xe3 <= '0';
+								if e(3) = '1' or e(2) = '1' then
+									-- the intermediate result in FPTEMP; in ETEMP too for
+									-- FMOVE, FABS and FNEG (FMOVE out keeps the source)
+									f(68) := x"00";
+									f(76) := ix(79 downto 72); f(77) := ix(71 downto 64);
+									for i in 0 to 7 loop
+										f(80 + i) := ix(63 - 8 * i downto 56 - 8 * i);
+									end loop;
+									if store = '0' then
+										f(60)(7 downto 5) := "000";
+										f(88) := ix(79 downto 72); f(89) := ix(71 downto 64);
+										for i in 0 to 7 loop
+											f(92 + i) := ix(63 - 8 * i downto 56 - 8 * i);
+										end loop;
+									end if;
+								elsif lneg then
+									-- the rounded integer, sign-extended, as x_operr checks
+									-- it (check_upper)
+									f(68) := x"00";
+									f(76) := x"C0"; f(77) := x"00";
+									f(80) := x"FF"; f(81) := x"FF"; f(82) := x"FF"; f(83) := x"FF";
+									v32 := alu_res(31 downto 0);
+									if alu_rp = "00" then v32 := x"FFFFFF80"; elsif alu_rp = "01" then v32 := x"FFFF8000"; end if;
+									f(84) := v32(31 downto 24); f(85) := v32(23 downto 16);
+									f(86) := v32(15 downto 8); f(87) := v32(7 downto 0);
+								elsif store = '1' and e(4) = '1' and alu_op = x"A" then
+									-- an integer out of range: FPTEMP the largest exponent,
+									-- so that the FPSP stores the largest integer of the sign
+									f(68) := x"00";
+									f(76) := alu_src(79) & "1111111"; f(77) := x"FF";
+									for i in 0 to 7 loop
+										f(80 + i) := x"00";
+									end loop;
+								end if;
+							end if;
+							if store = '1' then
+								f(73) := x"10";											-- T
+								xst <= '1';
+								xpost_r <= '1';
+							end if;
+							xf <= f;
+							xpend <= '1';
 						end if;
 						if store = '1' then
 							state <= ST_STORE;
@@ -924,7 +1341,13 @@ begin
 						when "001" => v32 := x_to_sgl(x);
 						when others => v32 := x(31 downto 0);
 					end case;
-					if fmt = "101" then
+					if fmt = "010" then
+						buf(0) <= x(79 downto 72); buf(1) <= x(71 downto 64);
+						buf(2) <= x"00"; buf(3) <= x"00";
+						for i in 0 to 7 loop
+							buf(4 + i) <= x(63 - 8 * i downto 56 - 8 * i);
+						end loop;
+					elsif fmt = "101" then
 						v64 := x_to_dbl(x);
 						for i in 0 to 7 loop
 							buf(i) <= v64(63 - 8 * i downto 56 - 8 * i);
@@ -946,6 +1369,7 @@ begin
 							when others => wr_size <= "10";
 						end case;
 						done_r <= '1';
+						xnow <= xst;			-- FMOVE out: the post-instruction exception
 						state <= ST_FINISH;
 					else
 						xa <= addr; xi <= 0; xn <= nbytes; xwr <= '1';
@@ -1017,6 +1441,9 @@ begin
 					end if;
 					unimp_pend <= '0';
 					busy_pend <= '0';
+					xpend <= '0';
+					cusave <= x"00"; re1 <= '0'; re3 <= '0'; ru <= '0';
+					xf(0) <= buf(0); xf(1) <= buf(1); xf(2) <= buf(2); xf(3) <= buf(3);
 					if buf(0) = x"00" then
 						fpr <= (others => FP_NAN);
 						fpcr <= (others => '0');
@@ -1028,7 +1455,13 @@ begin
 					elsif buf(1) = x"60" then
 						null_state <= '0';
 						xa <= addr + 4; xi <= 4; xn <= 100; xwr <= '0';
-						xrframe <= '1';
+						xrframe <= '1'; xro <= 0; xsmall <= '0';
+						state <= ST_XFER; ret_state <= ST_RESTORE_B;
+					elsif buf(1) = x"30" then
+						-- the 26-word frame: an E1 exception comes back from it
+						null_state <= '0';
+						xa <= addr + 4; xi <= 4; xn <= 52; xwr <= '0';
+						xrframe <= '1'; xro <= 48; xsmall <= '1';
 						state <= ST_XFER; ret_state <= ST_RESTORE_B;
 					else
 						null_state <= '0';
@@ -1041,24 +1474,45 @@ begin
 					-- FPTEMP, the result to its FPn
 					opm := cmd1b(6 downto 0);
 					e := '0' & op_of(opm);
-					if cusave = x"FE" and re1 = '0' and re3 = '0' and e(4) = '1' then
+					if (re1 = '1' or re3 = '1') and ru = '0' then
+						-- an exceptional state (U clear): pending again, with the vector the
+						-- 68040 derives from it (gen_except of the FPSP: NMCEXC for
+						-- E1, the FPSR for E3, else INEX)
+						if re3 = '1' then
+							xm := "00" & fpsr(12) & fpsr(11) & (fpsr(10) and fpcr(10)) &
+							      ((fpsr(9) or fpsr(8)) and (fpcr(9) or fpcr(8)));
+						else
+							xm := (xf(57)(3) or (fpsr(14) and fpcr(14))) & (xf(57)(2) or (fpsr(13) and fpcr(13))) &
+							      (xf(57)(1) or (fpsr(12) and fpcr(12))) & (xf(57)(0) or (fpsr(11) and fpcr(11))) &
+							      (fpsr(10) and fpcr(10)) & ((fpsr(9) or fpsr(8)) and (fpcr(9) or fpcr(8)));
+						end if;
+						xvec_r <= xvec_of(xm);
+						xe3 <= re3;
+						if re1 = '1' and re3 = '0' and fpsr(15) = '1' and fpcr(15) = '1' then
+							xvec_r <= "000";		-- BSUN
+						end if;
+						xpend <= '1';
+						done_r <= '1';
+						state <= ST_FINISH;
+					elsif xsmall = '0' and cusave = x"FE" and re1 = '0' and re3 = '0' and e(4) = '1' then
 						alu_op <= e(3 downto 0);
 						cw <= cmd1b;
 						if opm(6) = '1' then
 							if opm(2) = '1' then alu_rp <= "10"; else alu_rp <= "01"; end if;
 						else
-							alu_rp <= fpcr(7 downto 6);
+							alu_rp <= fpcr(7) & (fpcr(6) and not fpcr(7));	-- 11: double
 						end if;
 						alu_rm <= fpcr(5 downto 4);
 						alu_tomem <= '0';
-						alu_src <= etemp;
-						alu_dst <= fptemp;
+						alu_src <= frame_x(etemp, xf(60)(4));
+						alu_dst <= frame_x(fptemp, xf(68)(4));
 						if opm /= "0111000" and opm /= "0111010" then
 							wr_fp <= '1';
 						end if;
 						set_cc <= '1';
 						uop <= '0';
 						pk <= '0';
+						rfun <= '1';
 						state <= ST_ALU;
 					else
 						done_r <= '1';
