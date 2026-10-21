@@ -154,7 +154,8 @@ entity TG68KdotC_Kernel is
 		regin_out				: out std_logic_vector(31 downto 0);
 		CACR_out					: out std_logic_vector( 3 downto 0);
 		D_CACHE_out				: out std_logic;	-- data cache enable (CACR bit 8, or DE in the 68040 mode)
-		VBR_out					: out std_logic_vector(31 downto 0)
+		VBR_out					: out std_logic_vector(31 downto 0);
+		MMU_on_out				: out std_logic	-- 68040 mode, TC.E set: VBR and the vector fetches are logical addresses
 		);
 end TG68KdotC_Kernel;
 
@@ -5392,6 +5393,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
   CACR_out <= cinv040 & "00" & (CACR040(1) OR CACR040(0)) WHEN cpu040='1' ELSE CACR;
   data_write_lo <= data_write_mux(15 downto 0);		-- the low word of a long in one cycle
   VBR_out <= VBR;
+  MMU_on_out <= TC040E AND cpu040;
   -- the data cache stays on until software writes the CACR (MiSTer Minimig)
   D_CACHE_out <= CACR040(1) WHEN cpu040='1' ELSE
                  CACR_DC OR NOT CACR_DC_owned WHEN D_Cache_Bit = 1 ELSE '1';
