@@ -416,7 +416,10 @@ architecture logic of TG68KdotC_Kernel is
 	signal CACR040				: std_logic_vector(1 downto 0) := "00";	-- DE, IE
 	signal CACR_DC				: std_logic;
 	signal CACR_DC_owned		: std_logic;
-	signal cinv040				: std_logic := '0';		-- a CINV or CPUSH ran (until the next decode)
+	signal skipFetch_i			: std_logic;			-- a cycle MinimigAGA takes as internal
+	signal cinv040				: std_logic := '0';		-- a CINV or CPUSH ran: CACR_out bit 3
+	signal cinv_pend			: std_logic := '0';
+	signal cinv_cnt			: integer range 0 to 255 := 0;
 	signal TC040				: std_logic := '0';				-- P (E is kept clear)
 	signal ITT0, ITT1, DTT0, DTT1 : std_logic_vector(31 downto 0) := (others => '0');
 	signal MMUSR, URP, SRP	: std_logic_vector(31 downto 0) := (others => '0');
@@ -629,7 +632,11 @@ ALU: TG68K_ALU
 	);
 
 	-- AMR - let the parent module know this is a longword access.  (Easy way to enable burst writes.)
-	longword <= not memmaskmux(3);
+	-- Only for a cycle of the core: MinimigAGA's cache holds a write made with
+	-- it and takes the next write as its low word, while a table search of the
+	-- MMU (the U and M write of a descriptor), the FPU and MOVE16 write single
+	-- words under the core's pending long
+	longword <= '1' WHEN memmaskmux(3)='0' AND mmu_bact='0' AND fpu_bus_act='0' AND m16_active='0' ELSE '0';
 	
 	-- a long data access that can be done in one bus cycle: the first word
 	-- of a long (memmaskmux(3) clear, not a 3-word bit field access), aligned
@@ -734,9 +741,12 @@ ALU: TG68K_ALU
 	-- access at its physical address
 	clkena_core <= clkena_in AND NOT mmu_stall;
 	-- CPU space (FC 7, the interrupt acknowledge) is never translated (M68040 UM 3.1)
-	mmu_act <= '1' WHEN bus_l/="01" AND cpu040='1' AND
+	-- nor a cycle the core marks with skipFetch (the dummy read of CLR, Scc and
+	-- MOVE from SR, a skipped fetch), which MinimigAGA does not put on the bus
+	mmu_act <= '1' WHEN bus_l/="01" AND cpu040='1' AND skipFetch_i='0' AND
 	                    NOT (fc_int(1 downto 0)="11" AND fpu_bus_act='0' AND m16_active='0') ELSE '0';
 	FC <= fc_int;
+	skipFetch <= skipFetch_i AND NOT mmu_bact;
 	mmu_fc <= SVmode & "10" WHEN bus_l="00" ELSE SVmode & "01";
 	busstate <= "11" WHEN mmu_bact='1' AND mmu_bwr='1' ELSE
 	            "10" WHEN mmu_bact='1' ELSE
@@ -2069,7 +2079,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 		next_micro_state <= idle;
 		build_logical <= '0';
 		build_bcd <= '0';
-		skipFetch <= make_berr;
+		skipFetch_i <= make_berr;
 		set_writePCbig <= '0';
 --		set_recall_last <= '0';
 		set_Suppress_Base <= '0';
@@ -2633,7 +2643,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 										datatype <= "01";
 										write_back <='1';							-- im 68000 wird auch erst gelesen
 										IF cpu010='1' AND state="10" AND addrvalue='0' THEN
-											skipFetch <= '1';
+											skipFetch_i <= '1';
 										END IF;
 										IF opcode(5 downto 4)="00" THEN
 											set_exec(Regwrena) <= '1';
@@ -2684,7 +2694,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 									write_back <='1';
 									set_exec(opcAND) <= '1';
 									IF cpu010='1' AND state="10" AND addrvalue='0' THEN
-										skipFetch <= '1';
+										skipFetch_i <= '1';
 									END IF;
 									IF setexecOPC='1' THEN
 										set(OP1out_zero) <= '1';
@@ -3028,7 +3038,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 									END IF;
 								
 									IF micro_state=ld_AnXn1 AND brief(8)='0'THEN			--JMP/JSR n(Ax,Dn)
-										skipFetch <= '1';
+										skipFetch_i <= '1';
 									END IF;
 									IF state="00" THEN
 										writePC <= '1';
@@ -3036,7 +3046,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 									set(hold_dwr) <= '1';
 									IF set(get_ea_now)='1' THEN					--jsr
 										IF exec(longaktion)='0' OR long_done='1' THEN
-											skipFetch <= '1';
+											skipFetch_i <= '1';
 										END IF;
 										setstate <="01";
 										set(ea_to_pc) <= '1';
@@ -3129,7 +3139,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 												set_stop <= '1';	
 											END IF;
 											IF stop='1' THEN
-												skipFetch <= '1';
+												skipFetch_i <= '1';
 											END IF;		
 											
 										END IF;
@@ -3257,7 +3267,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 							write_back <= '1';
 							set_exec(opcScc) <= '1';
 							IF cpu010='1' AND state="10" AND addrvalue='0' THEN
-								skipFetch <= '1';
+								skipFetch_i <= '1';
 							END IF;
 							IF opcode(5 downto 4)="00" THEN
 								set_exec(Regwrena) <= '1';
@@ -4133,7 +4143,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 						TG68_PC_brw <= '1';	--pc+0000
 						next_micro_state <= nop;
 						if long_start='0' then
-							skipFetch <= '1'; -- AMR/GS - can't skip fetch for bra.l
+							skipFetch_i <= '1'; -- AMR/GS - can't skip fetch for bra.l
 						end if;
 					END IF;
 					
@@ -4144,7 +4154,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 				WHEN bsr2 =>		--bsr
 					IF long_start='0' THEN	
 						TG68_PC_brw <= '1';	
-						skipFetch <= '1';	-- AMR - can't skip fetch for bsr.l
+						skipFetch_i <= '1';	-- AMR - can't skip fetch for bsr.l
 					END IF;
 					set(longaktion) <= '1';
 					writePC <= '1';
@@ -4158,7 +4168,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 					IF exe_condition='0' THEN
 						Regwrena_now <= '1';
 						IF c_out(1)='1' THEN
-							skipFetch <= '1';				
+							skipFetch_i <= '1';				
 							next_micro_state <= nop;
 							TG68_PC_brw <= '1';	
 						END IF;	
@@ -4346,7 +4356,7 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 					setstate <= "10";
 					next_micro_state <= pack3;
 				WHEN pack3 =>	
-					skipFetch <= '1';
+					skipFetch_i <= '1';
 					
 				WHEN op_AxAy =>		-- op -(Ax),-(Ay)
 					IF opcode(11 downto 9)="111" THEN
@@ -5689,7 +5699,11 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
   -- CACR_out drives the caches outside the core (MinimigAGA: bit 0 enables
   -- them, a rising edge on bit 3 clears them, as in the 68020 CACR). In the
   -- 68040 mode bit 0 is DE or IE, and CINV or CPUSH of any cache raises bit 3
-  -- until the next instruction is decoded.
+  -- for 256 clocks, then holds it low for 16 before a CINV or CPUSH that came
+  -- meanwhile raises it again: MinimigAGA's cache (cpu_cache_new) samples the
+  -- bit only while the CPU does not access it, so a pulse of one instruction
+  -- was missed and the cache never cleared (AmigaOS's CacheClearU after
+  -- LoadSeg, ramlib).
   CACR_out <= cinv040 & "00" & (CACR040(1) OR CACR040(0)) WHEN cpu040='1' ELSE CACR;
   data_write_lo <= data_write_mux(15 downto 0);		-- the low word of a long in one cycle
   VBR_out <= VBR;
@@ -5702,12 +5716,26 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 	if rising_edge(clk) then
 	  if Reset = '1' then
 		cinv040 <= '0';
-	  elsif clkena_lw = '1' and decodeOPC = '1' then
-		if cpu040 = '1' and SVmode = '1' and opcode(15 downto 8) = X"F4" and opcode(4 downto 3) /= "00" and
-		   opcode(7 downto 6) /= "00" then
+		cinv_pend <= '0';
+		cinv_cnt <= 0;
+	  else
+		if cinv040 = '1' then
+		  if cinv_cnt = 0 then
+			cinv040 <= '0';
+			cinv_cnt <= 15;				-- low for 16 clocks
+		  else
+			cinv_cnt <= cinv_cnt - 1;
+		  end if;
+		elsif cinv_cnt /= 0 then
+		  cinv_cnt <= cinv_cnt - 1;
+		elsif cinv_pend = '1' then
 		  cinv040 <= '1';
-		else
-		  cinv040 <= '0';
+		  cinv_cnt <= 255;				-- high for 256 clocks
+		  cinv_pend <= '0';
+		end if;
+		if clkena_lw = '1' and decodeOPC = '1' and cpu040 = '1' and SVmode = '1' and opcode(15 downto 8) = X"F4" and
+		   opcode(4 downto 3) /= "00" and opcode(7 downto 6) /= "00" then
+		  cinv_pend <= '1';
 		end if;
 	  end if;
 	end if;
