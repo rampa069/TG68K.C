@@ -3,11 +3,17 @@
 --
 -- A small sequential unit for the operations the MC68040 FPU performs in
 -- hardware (M68040 User's Manual, section 9): move with rounding, FABS,
--- FNEG, FSQRT, FADD, FSUB, FMUL, FDIV, FCMP, FTST, and the conversion of an
+-- FNEG, FSQRT, FADD, FSUB, FMUL, FDIV, FCMP, FTST, FSGLDIV, FSGLMUL and the
+-- conversion of an
 -- extended value to an integer. Operands and results are 80-bit extended
 -- values as held in FP0-FP7. Denormalized and unnormalized operands are
 -- normalized and tiny results are denormalized here, so nothing is left to
 -- the M68040FPSP that the 68040 would trap for.
+--
+-- A biased exponent of 0 weighs 2^-16383 like any other exponent (the
+-- 68881/68882/68040 extended format, not the x87 one): $0000 8000...0 is
+-- the normalized 2^-16383, the extended minimum exponent is -16383 and a
+-- denormal is 0.f x 2^-16383 (M68040FPSP round.S nrm_zero; testbed-9bf.36).
 --
 -- Intermediate result (68040 UM figure 9-7): sign, 18-bit two's complement
 -- exponent and a 68-bit mantissa m: m(67) overflow, m(66) integer bit,
@@ -22,6 +28,10 @@
 -- op   0 move   1 abs   2 neg   3 sqrt   4 add   5 sub   6 mul   7 div
 --      8 cmp    9 tst   10 to integer (size in rprec: 0 byte, 1 word,
 --                          2 long; the integer is in result(31..0))
+--      11 sgldiv  12 sglmul: rounded to a single precision mantissa within
+--         the extended exponent range, whatever rprec; FSGLMUL multiplies
+--         the operands' mantissas truncated to single precision (PRM; the
+--         behaviour of WinUAE's softfloat, from the Previous emulator)
 -- rprec  0 extended, 1 single, 2 double; to_mem keeps a denormal result of
 --        single or double precision as a denormal (for a memory store),
 --        where a register keeps it normalized.
@@ -63,6 +73,8 @@ architecture rtl of TG68K_FPU_ALU is
 	constant OP_CMP  : integer := 8;
 	constant OP_TST  : integer := 9;
 	constant OP_INT  : integer := 10;
+	constant OP_SGLDIV : integer := 11;
+	constant OP_SGLMUL : integer := 12;
 
 	constant BIAS : integer := 16383;
 	constant DEFAULT_NAN : std_logic_vector(79 downto 0) := x"7FFF" & x"FFFFFFFFFFFFFFFF";
@@ -75,6 +87,7 @@ architecture rtl of TG68K_FPU_ALU is
 	signal rm  : std_logic_vector(1 downto 0);
 	signal pr  : std_logic_vector(1 downto 0);
 	signal tomem : std_logic;
+	signal sgl : std_logic;			-- FSGLDIV, FSGLMUL: single mantissa, extended range
 
 	-- operands: a = dst, b = src
 	signal raw_a, raw_b : std_logic_vector(79 downto 0);
@@ -152,6 +165,12 @@ begin
 						opi <= to_integer(unsigned(op));
 						rm <= rmode;
 						pr <= rprec;
+						sgl <= '0';
+						if to_integer(unsigned(op)) = OP_SGLDIV then
+							opi <= OP_DIV; pr <= "01"; sgl <= '1';
+						elsif to_integer(unsigned(op)) = OP_SGLMUL then
+							opi <= OP_MUL; pr <= "01"; sgl <= '1';
+						end if;
 						tomem <= to_mem;
 						raw_a <= dst;
 						raw_b <= src;
@@ -163,16 +182,8 @@ begin
 						sb <= src(79);
 						ma <= unsigned(dst(63 downto 0));
 						mb <= unsigned(src(63 downto 0));
-						if dst(78 downto 64) = "000000000000000" then
-							ea <= to_signed(1 - BIAS, 18);
-						else
-							ea <= signed("000" & dst(78 downto 64)) - BIAS;
-						end if;
-						if src(78 downto 64) = "000000000000000" then
-							eb <= to_signed(1 - BIAS, 18);
-						else
-							eb <= signed("000" & src(78 downto 64)) - BIAS;
-						end if;
+						ea <= signed("000" & dst(78 downto 64)) - BIAS;
+						eb <= signed("000" & src(78 downto 64)) - BIAS;
 						if dst(78 downto 64) = "111111111111111" then
 							za <= '0';
 							if dst(62 downto 0) = (62 downto 0 => '0') then
@@ -236,11 +247,14 @@ begin
 					case pr is
 						when "01" => emin <= to_signed(-126, 18); emax <= to_signed(127, 18);
 						when "10" => emin <= to_signed(-1022, 18); emax <= to_signed(1023, 18);
-						when others => emin <= to_signed(-16382, 18); emax <= to_signed(16383, 18);
+						when others => emin <= to_signed(-16383, 18); emax <= to_signed(16383, 18);
 					end case;
 					if opi = OP_INT then
 						emin <= to_signed(63, 18);
 						emax <= to_signed(63, 18);
+					end if;
+					if sgl = '1' then
+						emin <= to_signed(-16383, 18); emax <= to_signed(16383, 18);
 					end if;
 					if opi = OP_SUB then sbe := not sb; else sbe := sb; end if;
 					state <= FINISH;
@@ -362,6 +376,10 @@ begin
 								e_r <= ea + eb;
 								acc <= (others => '0');
 								mbs <= mb;
+								if sgl = '1' then
+									ma <= ma(63 downto 40) & x"0000000000";
+									mbs <= mb(63 downto 40) & x"0000000000";
+								end if;
 								mstk <= '0';
 								cnt <= 0;
 								state <= MUL_LOOP; done_r <= '0';
@@ -641,9 +659,9 @@ begin
 					elsif m_r(66) = '1' then
 						bexp := e_r + BIAS;
 						res <= s_r & std_logic_vector(bexp(14 downto 0)) & std_logic_vector(m_r(66 downto 3));
-					elsif pr = "00" or tomem = '1' then
+					elsif pr = "00" or tomem = '1' or sgl = '1' then
 						-- denormal at the precision's minimum exponent
-						if pr = "00" then
+						if pr = "00" or sgl = '1' then
 							res <= s_r & "000000000000000" & std_logic_vector(m_r(66 downto 3));
 						else
 							bexp := e_r + BIAS;

@@ -176,7 +176,10 @@ architecture rtl of TG68K_FPU is
 		variable e : unsigned(14 downto 0);
 	begin
 		if s(30 downto 23) = x"FF" then
-			return s(31) & "111111111111111" & '1' & s(22 downto 0) & x"0000000000";
+			-- an infinity or a NaN: the fraction left-justified, J clear
+			-- (the integer bit is a don't care there, PRM 1.6.5; a 68881/
+			-- 68882/68040 clears it)
+			return s(31) & "111111111111111" & '0' & s(22 downto 0) & x"0000000000";
 		elsif s(30 downto 23) = x"00" then
 			if s(22 downto 0) = (22 downto 0 => '0') then
 				return s(31) & (78 downto 0 => '0');
@@ -192,7 +195,7 @@ architecture rtl of TG68K_FPU is
 		variable e : unsigned(14 downto 0);
 	begin
 		if d(62 downto 52) = "11111111111" then
-			return d(63) & "111111111111111" & '1' & d(51 downto 0) & "00000000000";
+			return d(63) & "111111111111111" & '0' & d(51 downto 0) & "00000000000";
 		elsif d(62 downto 52) = "00000000000" then
 			if d(51 downto 0) = (51 downto 0 => '0') then
 				return d(63) & (78 downto 0 => '0');
@@ -314,6 +317,8 @@ architecture rtl of TG68K_FPU is
 			when "0100000" | "1100000" | "1100100" => return "10111";	-- FDIV
 			when "0111000" => return "11000";							-- FCMP
 			when "0111010" => return "11001";							-- FTST
+			when "0100100" => return "11011";							-- FSGLDIV
+			when "0100111" => return "11100";							-- FSGLMUL
 			when others => return "00000";
 		end case;
 	end function;
@@ -606,6 +611,8 @@ begin
 							when "0100000" | "1100000" | "1100100" => alu_op <= x"7";	-- FDIV
 							when "0111000" => alu_op <= x"8";							-- FCMP
 							when "0111010" => alu_op <= x"9";							-- FTST
+							when "0100100" => alu_op <= x"B";							-- FSGLDIV
+							when "0100111" => alu_op <= x"C";							-- FSGLMUL
 							when others => ok := false;
 						end case;
 						-- an operation the 68040 leaves to the FPSP: the source is
