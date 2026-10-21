@@ -483,6 +483,7 @@ architecture logic of TG68KdotC_Kernel is
 	signal dwr_l				: std_logic_vector(15 downto 0);
 	signal mmu_act, mmu_stall, mmu_quiet, mmu_fault, mmu_fault_pend : std_logic;
 	signal mmu_fc				: std_logic_vector(2 downto 0);
+	signal fc_int				: std_logic_vector(2 downto 0);
 	signal mmu_paddr, mmu_baddr, mmu_mmusr : std_logic_vector(31 downto 0);
 	signal mmu_bact, mmu_bwr	: std_logic;
 	signal mmu_bwdata			: std_logic_vector(15 downto 0);
@@ -674,7 +675,10 @@ ALU: TG68K_ALU
 	-- through the MMU: table search cycles, a held or quiet access, or the
 	-- access at its physical address
 	clkena_core <= clkena_in AND NOT mmu_stall;
-	mmu_act <= '1' WHEN bus_l/="01" AND cpu040='1' ELSE '0';
+	-- CPU space (FC 7, the interrupt acknowledge) is never translated (M68040 UM 3.1)
+	mmu_act <= '1' WHEN bus_l/="01" AND cpu040='1' AND
+	                    NOT (fc_int(1 downto 0)="11" AND fpu_bus_act='0' AND m16_active='0') ELSE '0';
+	FC <= fc_int;
 	mmu_fc <= SVmode & "10" WHEN bus_l="00" ELSE SVmode & "01";
 	busstate <= "11" WHEN mmu_bact='1' AND mmu_bwr='1' ELSE
 	            "10" WHEN mmu_bact='1' ELSE
@@ -1548,10 +1552,10 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 						alu_bf_ffo_offset <= bf_full_offset+bf_width+1;
 					END IF;
 					memread <= "1111";
-					FC(1) <= NOT setstate(1) OR (PCbase AND NOT setstate(0));
-					FC(0) <= setstate(1) AND (NOT PCbase OR setstate(0));
+					fc_int(1) <= NOT setstate(1) OR (PCbase AND NOT setstate(0));
+					fc_int(0) <= setstate(1) AND (NOT PCbase OR setstate(0));
 					IF interrupt='1' THEN
-						FC(1 downto 0) <= "11";
+						fc_int(1 downto 0) <= "11";
 					END IF;	
 					
 					IF state="11" OR xc_now='1' THEN
@@ -1565,7 +1569,7 @@ PROCESS (clk, IPL, setstate, addrvalue, state, exec_write_back, set_direct_data,
 						addrvalue <= '0';
 					ELSIF execOPC='1' AND exec_write_back='1' THEN
 						state <= "11";
-						FC(1 downto 0) <= "01";
+						fc_int(1 downto 0) <= "01";
 						memmask <= wbmemmask;
 						addrvalue <= '0';
 					ELSIF xc_now='1' THEN
@@ -1788,7 +1792,7 @@ PROCESS (clk, Reset, FlagsSR, last_data_read, OP2out, exec)
 		
 		IF rising_edge(clk) THEN
 			IF Reset='1' THEN
-				FC(2) <= '1';
+				fc_int(2) <= '1';
 				SVmode <= '1';
 				preSVmode <= '1';
 				FlagsSR <= "00100111";
@@ -1817,13 +1821,13 @@ PROCESS (clk, Reset, FlagsSR, last_data_read, OP2out, exec)
 					make_trace <= '0';
 					IF preSVmode='0' THEN
 						preSVmode <= '1';
-						FC(2) <= '1';
+						fc_int(2) <= '1';
 					END IF;
 				END IF;
 				IF set(changeMode)='1' THEN
 					preSVmode <= NOT preSVmode;
 					FlagsSR(5) <= NOT preSVmode;
-					FC(2) <= NOT preSVmode;
+					fc_int(2) <= NOT preSVmode;
 				END IF;
 				IF micro_state=trap3 THEN
 					FlagsSR(7) <= '0';
@@ -1839,12 +1843,12 @@ PROCESS (clk, Reset, FlagsSR, last_data_read, OP2out, exec)
 				END IF;	
 				IF exec(to_SR)='1' THEN
 					FlagsSR(7 downto 0) <= SRin;	--SR
-					FC(2) <= SRin(5);
+					fc_int(2) <= SRin(5);
 				ELSIF exec(update_FC)='1' THEN
-					FC(2) <= FlagsSR(5);
+					fc_int(2) <= FlagsSR(5);
 				END IF;
 				IF interrupt='1' THEN
-					FC(2) <= '1';
+					fc_int(2) <= '1';
 				END IF;	
 				IF cpu(1)='0' THEN
 					FlagsSR(4) <= '0';
