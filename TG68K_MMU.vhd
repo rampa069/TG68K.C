@@ -32,6 +32,13 @@ use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
 entity TG68K_MMU is
+	generic (
+		-- the translation goes to the bus from two registered entries (the
+		-- last page of the fetches and of the data), so the 8-entry search is
+		-- off the address path: a page change holds the core one cycle (stall)
+		-- while the entry is loaded from the ATC (testbed-9bf.40)
+		REG_XLATE : boolean := false
+	);
 	port (
 		clk        : in  std_logic;
 		reset      : in  std_logic;
@@ -94,6 +101,16 @@ architecture rtl of TG68K_MMU is
 	-- lookup results
 	signal tt_hit, atc_hit, atc_need_m, atc_fault, need_walk : std_logic;
 	signal hit_pp : std_logic_vector(19 downto 0);
+	signal hit_idx : integer range 0 to N - 1;
+
+	-- REG_XLATE: the entries the bus uses, 0 data, 1 fetches
+	signal u_v, u_super, u_w, u_m, u_s, u_inv : std_logic_vector(1 downto 0) := (others => '0');
+	type upage_t is array (0 to 1) of unsigned(19 downto 0);
+	signal u_lp, u_pp : upage_t;
+	signal u_sel : integer range 0 to 1;
+	signal u_hit, u_fault, u_need_m, u_miss, u_walk : std_logic;
+	signal u_pg : std_logic_vector(19 downto 0);
+	signal u_regs : std_logic_vector(128 downto 0);	-- TT registers and P the entries were loaded with
 
 	function tt_match(tt : std_logic_vector(31 downto 0); a : std_logic_vector(31 downto 0);
 					  s : std_logic) return boolean is
@@ -145,18 +162,41 @@ begin
 			end if;
 		end loop;
 		atc_hit <= hit;
+		hit_idx <= idx;
 		hit_pp <= std_logic_vector(e_pp(idx));
 		-- a write to a page whose M bit is clear goes through the tables
 		atc_need_m <= wr and not e_m(idx) and not e_w(idx) and not e_inv(idx);
 		atc_fault <= e_inv(idx) or (wr and e_w(idx)) or (e_s(idx) and not fc(2));
 	end process;
 
-	need_walk <= '1' when act = '1' and tc_e = '1' and tt_hit = '0' and
-						  (atc_hit = '0' or (atc_need_m = '1' and atc_fault = '0')) else '0';
-	stall <= '1' when need_walk = '1' or (ws /= W_IDLE and w_test = '0') else '0';
-	quiet <= '1' when act = '1' and tc_e = '1' and tt_hit = '0' and atc_hit = '1' and atc_fault = '1' else '0';
+	-- REG_XLATE: the registered entry of this access, and what it says
+	u_sel <= 1 when fc(1 downto 0) = "10" else 0;
+	u_pg <= page_of(laddr, tc_p);
+	u_hit <= '1' when u_v(u_sel) = '1' and u_super(u_sel) = fc(2) and u_lp(u_sel) = unsigned(u_pg) else '0';
+	u_fault <= u_inv(u_sel) or (wr and u_w(u_sel)) or (u_s(u_sel) and not fc(2));
+	u_need_m <= wr and not u_m(u_sel) and not u_w(u_sel) and not u_inv(u_sel);
+	-- not in the registered entry: one cycle to load it from a transparent
+	-- translation or the ATC, or the table search when both miss. A
+	-- transparent page is held in the entry too (as itself), so with
+	-- translation on the physical page always comes from the entry and no
+	-- compare of this access's address is on the address path
+	u_miss <= '1' when act = '1' and tc_e = '1' and u_hit = '0' else '0';
+	u_walk <= '1' when act = '1' and tc_e = '1' and u_hit = '1' and
+					   u_need_m = '1' and u_fault = '0' else '0';
 
-	paddr <= laddr when tc_e = '0' or tt_hit = '1' else
+	need_walk <= (u_miss and not tt_hit and not atc_hit) or u_walk WHEN REG_XLATE ELSE
+				 '1' when act = '1' and tc_e = '1' and tt_hit = '0' and
+						  (atc_hit = '0' or (atc_need_m = '1' and atc_fault = '0')) else '0';
+	stall <= '1' when (REG_XLATE and (u_miss = '1' or u_walk = '1')) or
+					  (not REG_XLATE and need_walk = '1') or (ws /= W_IDLE and w_test = '0') else '0';
+	quiet <= '1' when act = '1' and tc_e = '1' and
+					  ((REG_XLATE and u_hit = '1' and u_fault = '1') or
+					   (not REG_XLATE and tt_hit = '0' and atc_hit = '1' and atc_fault = '1')) else '0';
+
+	paddr <= laddr when tc_e = '0' else
+			 std_logic_vector(u_pp(u_sel)(19 downto 1)) & laddr(12 downto 0) when REG_XLATE and tc_p = '1' else
+			 std_logic_vector(u_pp(u_sel)) & laddr(11 downto 0) when REG_XLATE else
+			 laddr when tt_hit = '1' else
 			 hit_pp(19 downto 1) & laddr(12 downto 0) when tc_p = '1' else
 			 hit_pp & laddr(11 downto 0);
 
@@ -178,6 +218,7 @@ begin
 			if reset = '1' then
 				ws <= W_IDLE;
 				e_valid <= (others => '0');
+				u_v <= "00";
 				fault_r <= '0';
 				done_r <= '0';
 				w_test <= '0';
@@ -194,8 +235,38 @@ begin
 					end loop;
 				end if;
 				-- an access that hits a faulting entry
-				if act = '1' and tc_e = '1' and tt_hit = '0' and atc_hit = '1' and atc_fault = '1' and ws = W_IDLE then
+				if act = '1' and tc_e = '1' and ws = W_IDLE and
+				   ((REG_XLATE and u_hit = '1' and u_fault = '1') or
+					(not REG_XLATE and tt_hit = '0' and atc_hit = '1' and atc_fault = '1')) then
 					fault_r <= '1';
+				end if;
+				-- REG_XLATE: load the registered entry from the ATC; drop both
+				-- when the ATC changes or translation is off
+				if REG_XLATE then
+					if u_miss = '1' and tt_hit = '1' and ws = W_IDLE then
+						u_v(u_sel) <= '1';				-- transparent: the page as itself
+						u_super(u_sel) <= fc(2);
+						u_lp(u_sel) <= unsigned(u_pg);
+						u_pp(u_sel) <= unsigned(u_pg);
+						u_w(u_sel) <= '0';
+						u_m(u_sel) <= '1';
+						u_s(u_sel) <= '0';
+						u_inv(u_sel) <= '0';
+					elsif u_miss = '1' and atc_hit = '1' and ws = W_IDLE then
+						u_v(u_sel) <= '1';
+						u_super(u_sel) <= fc(2);
+						u_lp(u_sel) <= unsigned(u_pg);
+						u_pp(u_sel) <= e_pp(hit_idx);
+						u_w(u_sel) <= e_w(hit_idx);
+						u_m(u_sel) <= e_m(hit_idx);
+						u_s(u_sel) <= e_s(hit_idx);
+						u_inv(u_sel) <= e_inv(hit_idx);
+					end if;
+					u_regs <= tc_p & itt0 & itt1 & dtt0 & dtt1;
+					if pflush = '1' or ws = W_FILL or tc_e = '0' or
+					   u_regs /= tc_p & itt0 & itt1 & dtt0 & dtt1 then
+						u_v <= "00";
+					end if;
 				end if;
 				case ws is
 				when W_IDLE =>
@@ -305,6 +376,12 @@ begin
 					-- load the cache; a faulting translation is cached too, so the
 					-- access completes quietly and reports the fault
 					d := desc;
+					-- one entry per page: an older one (a write that set M) goes
+					for i in 0 to N - 1 loop
+						if e_lp(i) = unsigned(page_of(w_la, tc_p)) and e_super(i) = w_super then
+							e_valid(i) <= '0';
+						end if;
+					end loop;
 					e_valid(victim) <= '1';
 					e_super(victim) <= w_super;
 					e_lp(victim) <= unsigned(page_of(w_la, tc_p));

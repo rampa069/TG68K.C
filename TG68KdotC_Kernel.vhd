@@ -120,7 +120,11 @@ entity TG68KdotC_Kernel is
 		D_Cache_Bit : integer := 0;
 		-- 68040 FPU: 1 as the MC68040, leaving to the M68040FPSP what it leaves
 		-- (OVFL, UNFL, denormalized operands...); 0 completes it all in hardware
-		FPU_FPSP : integer := 1
+		FPU_FPSP : integer := 1;
+		-- 68040 MMU: 1 puts registered translations on the address path (the
+		-- last page of the fetches and of the data), the ATC search behind
+		-- them, at one stall cycle per page change; 0 the ATC search directly
+		MMU_REG_XLATE : integer := 0
 		);
 	port(clk						: in std_logic;
 		nReset					: in std_logic;			--low active
@@ -758,6 +762,7 @@ ALU: TG68K_ALU
 	data_write <= mmu_bwdata WHEN mmu_bact='1' ELSE dwr_l;
 
 	mmu : entity work.TG68K_MMU
+		generic map (REG_XLATE => MMU_REG_XLATE = 1)
 		port map (clk => clk, reset => Reset, clkena => clkena_in, tc_e => TC040E, tc_p => TC040,
 				  urp => URP, srp => SRP, itt0 => ITT0, itt1 => ITT1, dtt0 => DTT0, dtt1 => DTT1,
 				  act => mmu_act, laddr => addr_l, wr => mmu_wr, fc => mmu_fc, paddr => mmu_paddr,
