@@ -545,6 +545,7 @@ architecture logic of TG68KdotC_Kernel is
 	-- 68040 FPU (TG68K_FPU): the kernel decodes, builds the effective address
 	-- of the modes it shares with the integer unit and waits in fpu_wait
 	signal fpu_ins				: std_logic;	-- cpGEN, FSAVE or FRESTORE of the FPU
+	signal fpu_srbad			: std_logic;	-- FSAVE, FRESTORE with a mode they have no form for
 	signal fpu_gen				: std_logic;	-- cpGEN (a command word follows)
 	signal fpu_memea			: std_logic;	-- effective address built by the kernel
 	signal fpu_fbcc				: std_logic;
@@ -3729,8 +3730,10 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 								set(longaktion) <= '1';
 							END IF;
 						END IF;
-					ELSIF fpu_ins='0' THEN
-						-- FSAVE/FRESTORE-like encodings that are not instructions
+					ELSIF fpu_ins='0' OR fpu_srbad='1' THEN
+						-- FSAVE/FRESTORE-like encodings that are not instructions, and
+						-- FSAVE/FRESTORE with a register or a mode 7 past #imm: Line-F,
+						-- before the privilege check (UM 8.3, table 8-4)
 						trap_1111 <= '1';
 						trapmake <= '1';
 					ELSIF opcode(8)='1' AND SVmode='0' THEN
@@ -5320,6 +5323,8 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
                           opcode(2 downto 1)/="00" ELSE '0';
   fpu_ins <= '1' WHEN fpu_gen='1' OR (cpu040='1' AND opcode(15 downto 7)="111100110" AND opcode(6)='0') OR
                       (cpu040='1' AND opcode(15 downto 6)="1111001101") ELSE '0';
+  fpu_srbad <= '1' WHEN cpu040='1' AND opcode(15 downto 7)="111100110" AND
+                        (opcode(5 downto 4)="00" OR (opcode(5 downto 3)="111" AND opcode(2 downto 0)>"100")) ELSE '0';
   -- (d16,An), (d8,An,Xn), absolute and PC-relative modes
   fpu_memea <= '1' WHEN (opcode(5 downto 3)="101" OR opcode(5 downto 3)="110" OR
                          (opcode(5 downto 3)="111" AND opcode(2)='0')) AND fpu_ftrapcc='0' ELSE '0';
@@ -5387,15 +5392,16 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
   fpu_rd_data <= regfile(fpu_rd_idx);
 
   -- the command word of a cpGEN instruction is on data_read during its
-  -- decode, and is in sndOPC from the next cycle, fpu_go, where FMOVECR and
-  -- effective addresses the instruction does not allow take Line-F (from the
+  -- decode, and is in sndOPC from the next cycle, fpu_go, where an FMOVECR
+  -- with a nonzero <ea> field and effective addresses the instruction does
+  -- not allow take Line-F (from the
   -- register: the data bus in the decode logic made a path from the memory
   -- to every register of the core in MinimigAGA)
   process (sndOPC, opcode)
 	variable c : std_logic_vector(15 downto 0);
 	variable m : std_logic_vector(2 downto 0);
 	variable r : std_logic_vector(2 downto 0);
-	variable src, single : boolean;
+	variable src, single, movecr : boolean;
   begin
 	c := sndOPC;
 	m := opcode(5 downto 3);
@@ -5404,8 +5410,17 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 	-- effective address modes the instruction does not allow (PRM section 5)
 	src := c(15 downto 13) = "010" or c(15 downto 13) = "100" or c(15 downto 13) = "110";
 	single := c(12 downto 10) = "100" or c(12 downto 10) = "010" or c(12 downto 10) = "001";
+	-- FMOVECR: an unimplemented instruction (UM table 9-10, vector 11 with a
+	-- format $2 frame, from the FPU) when its <ea> field is 0; with another
+	-- one Line-F (format $0), which the M68040FPSP takes for an FMOVECR too
+	-- (x_fline.sa)
+	movecr := c(15 downto 10) = "010111";
 	if c(15 downto 13) /= "000" then
-	  if m = "001" and not ((c(15 downto 13) = "100" or c(15 downto 13) = "101") and c(12 downto 10) = "001") then
+	  if movecr then
+		if opcode(5 downto 0) /= "000000" then
+		  fpu_unimpl <= '1';
+		end if;
+	  elsif m = "001" and not ((c(15 downto 13) = "100" or c(15 downto 13) = "101") and c(12 downto 10) = "001") then
 		fpu_unimpl <= '1';					-- An: only a single FPIAR
 	  elsif m = "000" and (c(15 downto 13) = "110" or c(15 downto 13) = "111" or
 						   ((c(15 downto 13) = "100" or c(15 downto 13) = "101") and not single) or
@@ -5426,11 +5441,9 @@ PROCESS (clk, cpu, OP1out, OP2out, opcode, exe_condition, nextpass, micro_state,
 	case c(15 downto 13) is
 	  when "000" | "010" =>
 		-- operations the 68040 leaves to the FPSP run as far as the operand
-		-- fetch and take vector 11 with a format $2 frame (TG68K_FPU)
-		-- FMOVECR; packed decimal goes to the FPU (vector 55)
-		if c(14) = '1' and c(12 downto 10) = "111" then
-		  fpu_unimpl <= '1';
-		end if;
+		-- fetch and take vector 11 with a format $2 frame (TG68K_FPU);
+		-- packed decimal goes to the FPU (vector 55)
+		null;
 	  when "011" => null;		-- FMOVE.P out included (vector 55)
 	  when "110" | "111" => null;		-- static or dynamic register lists
 	  when "100" | "101" => null;

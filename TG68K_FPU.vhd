@@ -24,8 +24,10 @@
 -- floating-point instruction exception (vector 11, format $2); the FSAVE
 -- of the FPSP then gets the 26-word unimplemented instruction frame with
 -- the command word, the source (ETEMP), the destination register (FPTEMP)
--- and their tags. FMOVECR is recognized by the kernel, which takes Line-F
--- with a format $0 frame (the FPSP emulates FMOVECR from that). Packed
+-- and their tags. FMOVECR is one of them (UM table 9-10): nothing to fetch,
+-- the frame holds its command word for the FPSP's smovcr; with a nonzero
+-- <ea> field the kernel takes Line-F (format $0) instead, which the FPSP
+-- emulates FMOVECR from too (x_fline.sa). Packed
 -- decimal is an unsupported data type, as on the 68040 (UM 9.6.2): a packed
 -- source is read as it is (bits 95-64 to FPTEMP, 63-0 to ETEMP) and
 -- unsupp is set with done, and the kernel takes vector 55 with a format $0
@@ -571,6 +573,7 @@ begin
 		variable fpn : integer range 0 to 7;
 		variable idx : integer range 0 to 11;
 		variable isop : boolean;
+		variable movecr : boolean;
 		variable hit : std_logic;
 		variable xm : std_logic_vector(5 downto 0);
 		variable f : frame_t;
@@ -831,12 +834,10 @@ begin
 						end case;
 						-- an operation the 68040 leaves to the FPSP: the source is
 						-- fetched and converted all the same (ST_UNIMP)
-						if ok then uop <= '0'; else uop <= '1'; end if;
-						isop := ok;
+						movecr := cls = "010" and fmt = "111";
+						if ok and not movecr then uop <= '0'; else uop <= '1'; end if;
+						isop := ok and not movecr;
 						ok := true;
-						if cls = "010" and fmt = "111" then
-							ok := false;		-- FMOVECR: the kernel took Line-F
-						end if;
 						if cls = "010" and fmt = "011" then
 							pk <= '1';			-- packed decimal: an unsupported data type
 						end if;
@@ -860,7 +861,11 @@ begin
 							end if;
 							set_cc <= '1';
 							fpiar <= iaddr;
-							if cls = "000" then
+							if movecr then
+								-- FMOVECR: no operand; ETEMP 0
+								alu_src <= (others => '0');
+								state <= ST_UNIMP;
+							elsif cls = "000" then
 								alu_src <= fpr(to_integer(unsigned(cw(12 downto 10))));
 								if isop and FPSP = 0 then
 									alu_start <= '1';		-- the unit starts now (no ST_ALU)
@@ -888,7 +893,9 @@ begin
 							end if;
 						end if;
 					elsif cls = "011" then
-						-- FMOVE FPn,<ea>
+						-- FMOVE FPn,<ea> (through ST_ALU: not an unimplemented one,
+						-- whatever the instruction before was)
+						uop <= '0';
 						fpn := to_integer(unsigned(cw(9 downto 7)));
 						alu_src <= fpr(fpn);
 						alu_dst <= fpr(fpn);

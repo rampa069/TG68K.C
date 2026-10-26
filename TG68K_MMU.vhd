@@ -18,7 +18,9 @@
 -- the kernel takes it as an access error (format $7 frame).
 --
 -- PTEST searches the tables for ptest_addr with the function code in
--- ptest_fc, loads the cache and returns the MMU status register value;
+-- ptest_fc, loads the cache and returns the MMU status register value; its
+-- search sets U, and for PTESTW M, as an access's does (UM 3.7.3 "performs
+-- a table search operation", 3.2.5);
 -- PFLUSH variants flush the cache (UM 3.7.2): pflush_all keeps no global
 -- entry (PFLUSHA, PFLUSH (An)), else the global ones stay (PFLUSHAN,
 -- PFLUSHN (An)); pflush_page limits it to the entries of the page of
@@ -314,7 +316,7 @@ begin
 								next_addr <= unsigned(d(31 downto 8) & w_la(17 downto 12) & "00");
 							end if;
 							lvl <= lvl + 1;
-							if d(3) = '0' and w_test = '0' then
+							if d(3) = '0' then
 								-- set U in this descriptor, then read the next level
 								upd_data <= d(15 downto 4) & '1' & d(2 downto 0);
 								upd_table <= '1';
@@ -354,7 +356,7 @@ begin
 							if w_wr = '1' and wrp = '0' and not (d(7) = '1' and w_super = '0') then
 								nu(4) := '1';
 							end if;
-							if nu /= d(15 downto 0) and w_test = '0' then
+							if nu /= d(15 downto 0) then
 								upd_data <= nu;
 								upd_table <= '0';
 								desc(15 downto 0) <= nu;
